@@ -1,0 +1,185 @@
+// Copyright (C) 2021-2022 Intel Corporation
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+import React, { useEffect } from 'react';
+import Mousetrap from 'mousetrap';
+import { ShortcutScope } from './enums';
+
+export interface KeyMapItem {
+    name: string;
+    description: string;
+    sequences: string[];
+    displayedSequences?: string[];
+    scope: ShortcutScope;
+    nonActive?: boolean;
+    applicable?: string[];
+    displayWeight?: number;
+}
+
+export interface KeyMap {
+    [index: string]: KeyMapItem;
+}
+
+export interface Handlers {
+    [index: string]: (event: KeyboardEvent, shortcut: string) => void;
+}
+
+interface Props {
+    children?: JSX.Element;
+    keyMap: KeyMap;
+    handlers: Handlers;
+}
+
+const applicationKeyMap: KeyMap = {};
+
+const NON_TEXT_INPUT_TYPES = new Set([
+    'button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit',
+]);
+
+function isVisible(element: HTMLElement): boolean {
+    if (element.getAttribute('aria-hidden') === 'true') {
+        return false;
+    }
+    const style = window.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+}
+
+// Ant Design 5 keeps closed dialogs in the DOM: display:none is on .ant-modal-wrap,
+// not on .ant-modal. Checking .ant-modal.style.display treated leftover dialogs as open
+// and blocked every Mousetrap shortcut (Delete, N, frame keys, …).
+export function isAnyAntModalOpen(): boolean {
+    const wraps = Array.from(
+        window.document.getElementsByClassName('ant-modal-wrap'),
+    ) as HTMLElement[];
+    return wraps.some((wrap) => isVisible(wrap));
+}
+
+// Closed Ant Design Select/combobox uses a real <input>. After selecting a box, that
+// input often has focus, so treating every INPUT as "typing" swallowed Delete and N.
+export function isTypingTarget(element: Element | null): boolean {
+    if (!element || !(element instanceof HTMLElement)) {
+        return false;
+    }
+
+    if (element.isContentEditable) {
+        return true;
+    }
+
+    const tag = element.tagName;
+    if (tag === 'TEXTAREA' || tag === 'SELECT') {
+        return true;
+    }
+
+    if (tag !== 'INPUT') {
+        return false;
+    }
+
+    const input = element as HTMLInputElement;
+    const type = (input.type || 'text').toLowerCase();
+    if (NON_TEXT_INPUT_TYPES.has(type)) {
+        return false;
+    }
+
+    const expanded = input.getAttribute('aria-expanded');
+    const role = input.getAttribute('role');
+    const inClosedCombobox = (
+        (role === 'combobox' || input.classList.contains('ant-select-selection-search-input')) &&
+        expanded !== 'true'
+    );
+    if (inClosedCombobox) {
+        return false;
+    }
+
+    return true;
+}
+
+const MODIFIER_ONLY_KEYS = new Set(['ctrl', 'control', 'alt', 'shift', 'meta', 'command', 'mod', 'option']);
+
+// OS / IM screenshot tools (WeChat / QQ / DingTalk Ctrl+Alt+A, some Alt+A variants).
+// Marker: cvat-passthrough-screenshot
+const SCREENSHOT_PASSTHROUGH_COMBOS = new Set([
+    'ctrl+alt+a',
+    'alt+a',
+    'ctrl+shift+a',
+    'ctrl+shift+s',
+]);
+
+function isModifierOnlyCombo(combo: string): boolean {
+    const parts = String(combo || '').toLowerCase().split('+').filter(Boolean);
+    return parts.length > 0 && parts.every((key) => MODIFIER_ONLY_KEYS.has(key));
+}
+
+export function shouldAllowNativeKeyDefault(combo: string): boolean {
+    const c = String(combo || '').toLowerCase();
+    return isModifierOnlyCombo(c) || SCREENSHOT_PASSTHROUGH_COMBOS.has(c);
+}
+
+export default function GlobalHotKeys(props: Props): JSX.Element {
+    const { children, keyMap, handlers } = props;
+    useEffect(() => {
+        for (const key of Object.keys(keyMap)) {
+            const { sequences } = keyMap[key];
+            if (!sequences?.length) {
+                continue;
+            }
+            const handler = handlers[key];
+            Mousetrap.bind(sequences, (event, combo) => {
+                if (!shouldAllowNativeKeyDefault(combo)) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                }
+                if (handler) {
+                    handler(event, combo);
+                }
+            }, 'keydown');
+            applicationKeyMap[key] = keyMap[key];
+        }
+
+        return () => {
+            for (const key of Object.keys(keyMap)) {
+                const { sequences } = keyMap[key];
+                if (!sequences?.length) {
+                    continue;
+                }
+                Mousetrap.unbind(sequences, 'keydown');
+                delete applicationKeyMap[key];
+            }
+        };
+    });
+    return children || <></>;
+}
+
+Mousetrap.prototype.stopCallback = function (e: KeyboardEvent, element: Element, combo: string): boolean {
+    if (isTypingTarget(element)) {
+        return true;
+    }
+
+    const activeSequences = Object.values(applicationKeyMap).map((keyMapItem) => [...keyMapItem.sequences]).flat();
+    if (
+        !shouldAllowNativeKeyDefault(combo) &&
+        activeSequences.some((sequence) => sequence.startsWith(combo))
+    ) {
+        // prevent default behaviour of the event if potentially one of active shortcuts will be triggered
+        e?.preventDefault();
+    }
+
+    if (isAnyAntModalOpen()) {
+        const modalClosingSequences = ['SWITCH_SHORTCUTS', 'SWITCH_SETTINGS']
+            .map((key) => [...(applicationKeyMap[key]?.sequences ?? [])]).flat();
+
+        return !modalClosingSequences.some((seq) => {
+            const seqFragments = seq.split('+');
+            return combo.split('+').every((key, i) => seqFragments[i] === key);
+        });
+    }
+
+    return false;
+};
+
+export function getApplicationKeyMap(): KeyMap {
+    return {
+        ...applicationKeyMap,
+    };
+}

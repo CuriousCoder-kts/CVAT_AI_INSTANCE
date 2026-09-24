@@ -1,0 +1,749 @@
+import React, { useCallback, useMemo, useState } from 'react';
+import Card from 'antd/lib/card';
+import Button from 'antd/lib/button';
+import Switch from 'antd/lib/switch';
+import Tag from 'antd/lib/tag';
+import Space from 'antd/lib/space';
+import Tooltip from 'antd/lib/tooltip';
+import Popconfirm from 'antd/lib/popconfirm';
+import Text from 'antd/lib/typography/Text';
+import Drawer from 'antd/lib/drawer';
+import Collapse from 'antd/lib/collapse';
+import Empty from 'antd/lib/empty';
+import Divider from 'antd/lib/divider';
+import {
+    DeleteOutlined,
+    EditOutlined,
+    SettingOutlined,
+    CheckCircleOutlined,
+    SafetyOutlined,
+    EyeOutlined,
+    ClockCircleOutlined,
+    DownOutlined,
+    UpOutlined,
+    CopyOutlined,
+    CopyFilled,
+    ExpandOutlined,
+    RocketOutlined,
+    RightOutlined,
+    MinusCircleOutlined,
+    ApiOutlined,
+    DashboardOutlined,
+    CheckSquareOutlined,
+    FileTextOutlined,
+    CodeOutlined,
+} from '@ant-design/icons';
+import { useHistory } from 'react-router';
+import notification from 'antd/lib/notification';
+import { Organization, AIFunctionInstance } from 'cvat-core-wrapper';
+import { type LabelSpec, findPreset, sanitizePromptValue } from './presets';
+import { toClipboard } from 'utils/to-clipboard';
+
+export const FEATURE_KIND_META: Record<string, { label: string; color: string; desc: string }> = {
+    object_detector: {
+        label: 'Boxes / Polygons / Polylines',
+        color: 'blue',
+        desc: 'Object detection / instance segmentation / lane polylines — boxes, polygons, or polylines.',
+    },
+    image_caption: {
+        label: 'Image Caption',
+        color: 'cyan',
+        desc: 'Semantic image description — one natural-language sentence stored as an image-level attribute.',
+    },
+    intention_estimation: {
+        label: 'Intention / Trajectory',
+        color: 'geekblue',
+        desc: 'Intention estimation, trajectory prediction, ReID feature extraction (reserved).',
+    },
+    pose_estimation: {
+        label: 'Keypoints / Skeleton',
+        color: 'purple',
+        desc: 'Human/object keypoint detection, skeleton extraction (reserved).',
+    },
+    object_tracker: {
+        label: 'Object Tracker (optical flow)',
+        color: 'gold',
+        desc: 'Cross-frame association: Magic Wand → Trackers. Local OpenCV DIS or colleague HTTP /track. Rectangles only, forward only.',
+    },
+};
+
+export const PROVIDER_META: Record<string, { label: string; color: string }> = {
+    bailian: { label: 'Alibaba Bailian', color: 'geekblue' },
+    local:   { label: 'Local Deployment', color: 'green' },
+    openai:  { label: 'OpenAI',          color: 'purple' },
+    custom:  { label: 'Custom',          color: 'orange' },
+};
+
+export interface ConfigSummary {
+    model: string;
+    apiUrl: string;
+    executionMode: string;
+    outputFormat: string;
+    labelCount: number;
+    labelPreview: string[];
+    captionAttrName: string;
+    systemPromptLen: number;
+    userPromptLen: number;
+    parserConfigEntries: number;
+    hasApiKey: boolean;
+    unknownExtraKeys: string[];
+}
+
+export function bcResolveLabelSpec(cfg: Record<string, any> | undefined): LabelSpec[] {
+    const c = cfg || {};
+    if (typeof c.preset_id === 'string' && c.preset_id.trim()) {
+        const bundle = findPreset(c.preset_id);
+        if (bundle && Array.isArray(bundle.labels) && bundle.labels.length) {
+            return [...bundle.labels];
+        }
+    }
+    if (Array.isArray(c.labels) && c.labels.length) {
+        return c.labels.filter((l: any) => l && typeof l.name === 'string' && String(l.name).trim());
+    }
+    if (Array.isArray(c.preset_labels) && c.preset_labels.length) {
+        const asciiLookup: Record<string, string> = {};
+        if (Array.isArray(c.ascii_labels)) {
+            for (const m of c.ascii_labels) {
+                if (m && typeof m.ascii === 'string' && typeof m.name === 'string') {
+                    asciiLookup[String(m.name)] = String(m.ascii);
+                }
+            }
+        }
+        const attributesPerLabel = typeof c.attributes_per_label === 'object' && c.attributes_per_label ? c.attributes_per_label : {};
+        const out: LabelSpec[] = [];
+        for (let idx = 0; idx < c.preset_labels.length; idx++) {
+            const lb: any = c.preset_labels[idx];
+            if (!lb || typeof lb !== 'object') continue;
+            const cnName = String(lb.name || `label_${idx}`).trim();
+            if (!cnName) continue;
+            const asciiName = asciiLookup[cnName] || cnName;
+            const entry: LabelSpec = { name: asciiName };
+            if (lb.type) entry.type = lb.type;
+            const descParts: string[] = [];
+            if (typeof lb.description === 'string' && lb.description.trim()) descParts.push(lb.description.trim());
+            if (cnName !== asciiName) descParts.push(`Display / Chinese label name: ${cnName}`);
+            if (descParts.length) entry.description = descParts.join(' ');
+            const extraAttrs = Array.isArray(lb.attributes) ? lb.attributes : [];
+            const labelAttrs = Array.isArray(attributesPerLabel[cnName]) ? attributesPerLabel[cnName] : [];
+            const merged: any[] = [];
+            const seen = new Set<string>();
+            for (const src of [extraAttrs, labelAttrs]) {
+                if (!Array.isArray(src)) continue;
+                for (const a of src) {
+                    if (!a || typeof a !== 'object' || typeof a.name !== 'string') continue;
+                    const akey = String(a.name).trim();
+                    if (!akey || seen.has(akey)) continue;
+                    seen.add(akey); merged.push({ ...a });
+                }
+            }
+            if (merged.length) entry.attributes = merged;
+            out.push(entry);
+        }
+        return out;
+    }
+    if (typeof c.system_prompt_template === 'string' && c.system_prompt_template.length > 1000) {
+        const prompt = c.system_prompt_template;
+        const blocks: RegExpMatchArray[] = [
+            prompt.match(/Allowed\s+labels[^\n]*\n([\s\S]*?)(?:\n\s*\n|##|$)/i) || null,
+            prompt.match(/Allowed\s+labelx[^\n]*\n([\s\S]*?)(?:\n\s*\n|##|$)/i) || null,
+            prompt.match(/LABEL DEFINITIONS[^\n]*\n([\s\S]*?)(?:\n\s*\n|##|\([0-9]\)|$)/i) || null,
+        ].filter((m): m is RegExpMatchArray => !!m && m[1] && m[1].trim().length > 0);
+        for (const m of blocks) {
+            const lines = m[1].split(/\r?\n/);
+            const names: string[] = [];
+            const seen = new Set<string>();
+            for (const rawLine of lines) {
+                const line = rawLine.trim();
+                const bullet = line.match(/^[-*+•]\s*([A-Za-z_][A-Za-z0-9_-]*)/);
+                if (bullet) {
+                    const n = bullet[1];
+                    if (!seen.has(n) && n.length < 60) {
+                        seen.add(n); names.push(n);
+                    }
+                }
+            }
+            if (names.length >= 2) {
+                return names.map((n) => ({ name: n, type: 'rectangle' }));
+            }
+        }
+    }
+    return [];
+}
+
+export function summarizeConfig(cfg: Record<string, any> | undefined, hasSens: Record<string, any> | undefined): ConfigSummary {
+    const c = cfg || {};
+    const opc = (typeof c.output_parser_config === 'object' && c.output_parser_config) ? c.output_parser_config : {};
+    const labels = bcResolveLabelSpec(cfg);
+    const captionAttrName = String(opc.caption_attribute_name || c.caption_attribute_name || '');
+    const labelPreview = labels
+        .filter((l: any) => l && typeof l.name === 'string')
+        .map((l: any) => String(l.name))
+        .slice(0, 5);
+    let systemTpl = sanitizePromptValue(c.system_prompt_template);
+    let userTpl = sanitizePromptValue(c.user_prompt_template);
+    if ((!systemTpl || !userTpl) && c.preset_id) {
+        const p = findPreset(c.preset_id);
+        if (p && p.defaults) {
+            if (!systemTpl) systemTpl = sanitizePromptValue(p.defaults.system_prompt_template) || '';
+            if (!userTpl) userTpl = sanitizePromptValue(p.defaults.user_prompt_template) || '';
+        }
+    }
+    const reserved = new Set([
+        'api_url', 'api_key', 'model', 'execution_mode', 'output_format',
+        'system_prompt_template', 'user_prompt_template', 'prompt_variables',
+        'output_parser_config', 'labels', 'caption_attribute_name',
+        'preset_labels', 'ascii_labels', 'attributes', 'attributes_per_label',
+        'default_attributes', 'preset_id',
+        'http_file_field', 'http_form_fields', 'http_query_fields',
+        'http_timeout_seconds', 'local_backend', 'vision_backend',
+    ]);
+    const unknownExtraKeys = Object.keys(c).filter((k) => !reserved.has(k));
+    return {
+        model: String(c.model || ''),
+        apiUrl: String(c.api_url || ''),
+        executionMode: String(c.execution_mode || 'vlm_prompt'),
+        outputFormat: String(c.output_format || (labels.length ? 'rectangles' : 'captions')),
+        labelCount: labels.length,
+        labelPreview,
+        captionAttrName,
+        systemPromptLen: systemTpl.length,
+        userPromptLen: userTpl.length,
+        parserConfigEntries: Object.keys(opc).length,
+        hasApiKey: Boolean((hasSens && (hasSens.has_api_key || hasSens.api_key)) || c.api_key),
+        unknownExtraKeys,
+    };
+}
+
+function containsCJK(s: string): boolean {
+    return /[\u4e00-\u9fff\u3400-\u4dbf\uac00-\ud7af\u3040-\u30ff]/.test(String(s || ''));
+}
+
+interface Props {
+    organization: Organization;
+    instance: AIFunctionInstance;
+    onMutate: () => void;
+    readOnly?: boolean;
+}
+
+export default function AIFunctionInstanceCard(props: Props): JSX.Element {
+    const { instance, organization, onMutate, readOnly = false } = props;
+    const history = useHistory();
+    const fMeta = FEATURE_KIND_META[instance.featureKind] || { label: instance.featureKind, color: 'default', desc: '' };
+    const pMeta = PROVIDER_META[instance.provider] || { label: instance.provider, color: 'default' };
+
+    const cfg = (instance.config || {}) as Record<string, any>;
+    const hasSens = (instance.sensitiveExposed || {}) as Record<string, any>;
+    const summary = useMemo(() => summarizeConfig(cfg, hasSens), [cfg, hasSens]);
+    const resolvedLabels = useMemo(() => bcResolveLabelSpec(cfg), [cfg]);
+    const resolvedPromptTemplates = useMemo(() => {
+        let sys = sanitizePromptValue(cfg.system_prompt_template);
+        let usr = sanitizePromptValue(cfg.user_prompt_template);
+        if ((!sys || !usr) && cfg.preset_id) {
+            const p = findPreset(cfg.preset_id);
+            if (p && p.defaults) {
+                if (!sys) sys = sanitizePromptValue(p.defaults.system_prompt_template) || '';
+                if (!usr) usr = sanitizePromptValue(p.defaults.user_prompt_template) || '';
+            }
+        }
+        return { sys, usr };
+    }, [cfg.system_prompt_template, cfg.user_prompt_template, cfg.preset_id]);
+
+    const [drawerOpen, setDrawerOpen] = useState(false);
+    const [labelCountShow, setLabelCountShow] = useState(3);
+    const [promptsExpanded, setPromptsExpanded] = useState(false);
+    const [rawExpanded, setRawExpanded] = useState(false);
+    const [toggleLoading, setToggleLoading] = useState(false);
+    const [defaultLoading, setDefaultLoading] = useState(false);
+    const [deleteLoading, setDeleteLoading] = useState(false);
+
+    const onToggle = useCallback(async (next: boolean) => {
+        if (readOnly) return;
+        try {
+            setToggleLoading(true);
+            const nextInst = new AIFunctionInstance({
+                ...(instance as any),
+                id: instance.id,
+                slug: instance.slug,
+                name: instance.name,
+                organizationId: instance.organizationId,
+                featureKind: instance.featureKind,
+                provider: instance.provider,
+                isEnabled: next,
+                isDefault: instance.isDefault,
+                config: instance.config,
+            });
+            await organization.updateAIFunctionInstance(instance.slug, nextInst);
+            onMutate();
+            notification.success({ message: `Instance ${next ? 'enabled' : 'disabled'}`, description: instance.slug });
+        } catch (err: any) {
+            notification.error({ message: 'Toggle failed', description: err?.message || String(err) });
+        } finally {
+            setToggleLoading(false);
+        }
+    }, [readOnly, instance, organization, onMutate]);
+
+    const onSetDefault = useCallback(async () => {
+        if (readOnly || instance.isDefault) return;
+        try {
+            setDefaultLoading(true);
+            const nextInst = new AIFunctionInstance({
+                ...(instance as any),
+                id: instance.id,
+                slug: instance.slug,
+                name: instance.name,
+                organizationId: instance.organizationId,
+                featureKind: instance.featureKind,
+                provider: instance.provider,
+                isEnabled: instance.isEnabled,
+                isDefault: true,
+                config: instance.config,
+            });
+            await organization.updateAIFunctionInstance(instance.slug, nextInst);
+            onMutate();
+            notification.success({ message: 'Marked default', description: instance.slug });
+        } catch (err: any) {
+            notification.error({ message: 'Set default failed', description: err?.message || String(err) });
+        } finally {
+            setDefaultLoading(false);
+        }
+    }, [readOnly, instance, organization, onMutate]);
+
+    const onDelete = useCallback(async () => {
+        if (readOnly) return;
+        try {
+            setDeleteLoading(true);
+            await organization.deleteAIFunctionInstance(instance.slug);
+            onMutate();
+            notification.success({ message: 'Instance deleted', description: instance.slug });
+        } catch (err: any) {
+            notification.error({ message: 'Delete failed', description: err?.message || String(err) });
+        } finally {
+            setDeleteLoading(false);
+        }
+    }, [readOnly, instance, organization, onMutate]);
+
+    const labelsChip = useMemo(() => {
+        if (instance.featureKind === 'image_caption') {
+            const name = summary.captionAttrName || 'caption';
+            return <Tag color='cyan'>Caption: {name}</Tag>;
+        }
+        return <Tag color='purple'>{summary.labelCount} label{summary.labelCount === 1 ? '' : 's'}</Tag>;
+    }, [instance.featureKind, summary]);
+
+    return (
+        <>
+            <Card
+                bordered
+                className='cvat-ai-function-instance-card'
+                title={
+                    <Tooltip title={instance.slug}>
+                        <Text ellipsis style={{ display: 'inline-block', maxWidth: '100%' }} strong>{instance.name || instance.slug}</Text>
+                    </Tooltip>
+                }
+                extra={
+                    <Space size={[8, 8]} wrap>
+                        {instance.isDefault ? <Tag icon={<RocketOutlined />} color='gold'>Default</Tag> : null}
+                        {instance.name && instance.name !== instance.slug && containsCJK(instance.name) ? (
+                            <Tag color='magenta'>non-Latin name</Tag>
+                        ) : null}
+                        <Switch
+                            size='small'
+                            checked={instance.isEnabled}
+                            loading={toggleLoading}
+                            disabled={readOnly}
+                            onChange={onToggle}
+                        />
+                    </Space>
+                }
+                actions={[
+                    <Tooltip title='Inspect details' key='details'>
+                        <Button size='small' type='link' icon={<EyeOutlined />} onClick={() => setDrawerOpen(true)}>Details</Button>
+                    </Tooltip>,
+                    <Tooltip title={readOnly ? 'Read-only permission' : 'Edit this instance'} key='edit'>
+                        <Button size='small' type='link' icon={<EditOutlined />} disabled={readOnly} onClick={() => history.push(`/organization/ai-features/${instance.slug}`)}>Edit</Button>
+                    </Tooltip>,
+                    <Tooltip title={readOnly ? 'Read-only permission' : instance.isDefault ? 'Already the default' : 'Mark organization default'} key='default'>
+                        <Button size='small' type='link' icon={<CheckSquareOutlined />} disabled={readOnly || instance.isDefault} loading={defaultLoading} onClick={onSetDefault}>Default</Button>
+                    </Tooltip>,
+                    readOnly ? (
+                        <Tooltip title='Read-only permission' key='delete'>
+                            <Button size='small' type='link' danger disabled icon={<DeleteOutlined />}>Delete</Button>
+                        </Tooltip>
+                    ) : (
+                        <Popconfirm
+                            key='delete'
+                            title={`Delete instance "${instance.name || instance.slug}"?`}
+                            description='This action cannot be undone. Existing annotation results will not be affected.'
+                            okText='Delete'
+                            okType='danger'
+                            cancelText='Cancel'
+                            onConfirm={onDelete}
+                        >
+                            <Button size='small' type='link' danger icon={<DeleteOutlined />} loading={deleteLoading}>Delete</Button>
+                        </Popconfirm>
+                    ),
+                ]}
+            >
+                <div className='meta-row'>
+                    <Tag color={fMeta.color}>{fMeta.label}</Tag>
+                    <Tag color={pMeta.color}>{pMeta.label}</Tag>
+                    {summary.model ? <Tag icon={<DashboardOutlined />}>{summary.model}</Tag> : null}
+                    <Tag icon={<SettingOutlined />}>
+                        {summary.executionMode} · {summary.outputFormat}
+                    </Tag>
+                    {labelsChip}
+                </div>
+
+                <div className='labels-preview'>
+                    <div className='label-row-title'>Labels</div>
+                    {instance.featureKind === 'image_caption' ? (
+                        <Text type='secondary' italic>
+                            — image caption outputs image-level TAG attribute, no AI-side labels —
+                        </Text>
+                    ) : resolvedLabels.length === 0 ? (
+                        <Text type='secondary' className='no-labels-hint'>
+                            (none defined — open Edit or use a preset)
+                        </Text>
+                    ) : (
+                        <>
+                            {resolvedLabels.slice(0, 5).map((l) => (
+                                <Tag key={l.name} color='geekblue'>
+                                    {l.name}{l.type && l.type !== 'rectangle' ? ` · ${l.type}` : null}
+                                </Tag>
+                            ))}
+                            {resolvedLabels.length > 5 ? (
+                                <Tag>+{resolvedLabels.length - 5} more</Tag>
+                            ) : null}
+                        </>
+                    )}
+                </div>
+
+                <div className='summary-row'>
+                    <div className='summary-cell'>
+                        <span className='label'>Prompts</span>
+                        System {summary.systemPromptLen.toLocaleString()} chars
+                        {summary.userPromptLen ? ` · User ${summary.userPromptLen.toLocaleString()}` : ' · User —'}
+                    </div>
+                    <div className='summary-cell'>
+                        <span className='label'>Credentials</span>
+                        {summary.hasApiKey ? (
+                            <Tag color='green'><SafetyOutlined /> api_key: configured</Tag>
+                        ) : (
+                            <Tag color='red'><MinusCircleOutlined /> api_key: missing</Tag>
+                        )}
+                        {summary.unknownExtraKeys.length > 0 ? (
+                            <Tooltip title={summary.unknownExtraKeys.join(', ')}>
+                                <Tag color='purple'>extra: {summary.unknownExtraKeys.length}</Tag>
+                            </Tooltip>
+                        ) : null}
+                    </div>
+                </div>
+
+                <Space size={[12, 4]} style={{ marginTop: 8, color: 'rgba(0,0,0,0.45)' }} wrap>
+                    <Text type='secondary' style={{ fontSize: 12 }}>
+                        <ClockCircleOutlined /> {instance.updatedAt ? new Date(instance.updatedAt).toLocaleDateString() : '—'}
+                    </Text>
+                    {summary.parserConfigEntries > 0 ? (
+                        <Text type='secondary' style={{ fontSize: 12 }}>
+                            <CodeOutlined /> parser: {summary.parserConfigEntries} keys
+                        </Text>
+                    ) : null}
+                </Space>
+            </Card>
+
+            <Drawer
+                title={
+                    <Space size={[8, 8]} wrap>
+                        <strong>Details · {instance.name || instance.slug}</strong>
+                        {instance.isDefault ? <Tag icon={<RocketOutlined />} color='gold'>Default</Tag> : null}
+                        <Tag color={instance.isEnabled ? 'green' : 'default'}>
+                            {instance.isEnabled ? 'Enabled' : 'Disabled'}
+                        </Tag>
+                    </Space>
+                }
+                width={780}
+                open={drawerOpen}
+                onClose={() => setDrawerOpen(false)}
+                extra={
+                    <Space>
+                        <Button onClick={() => setDrawerOpen(false)}>Close</Button>
+                        <Tooltip title={readOnly ? 'Read-only permission' : 'Edit this instance'}>
+                            <Button type='primary' icon={<EditOutlined />} disabled={readOnly} onClick={() => { setDrawerOpen(false); history.push(`/organization/ai-features/${instance.slug}`); }}>Edit instance</Button>
+                        </Tooltip>
+                    </Space>
+                }
+                className='ai-feature-drawer'
+            >
+                <div className='drawer-section'>
+                    <div className='drawer-section-title'><EyeOutlined /> Overview & core info</div>
+                    <div className='overview-grid'>
+                        <div className='ov-cell'><span className='k'>Feature</span><span className='v'><Tag color={fMeta.color}>{fMeta.label}</Tag></span></div>
+                        <div className='ov-cell'><span className='k'>Provider</span><span className='v'><Tag color={pMeta.color}>{pMeta.label}</Tag></span></div>
+                        <div className='ov-cell'><span className='k'>Model</span><span className='v'>{summary.model || '—'}</span></div>
+                        <div className='ov-cell'><span className='k'>Execution</span><span className='v'>{summary.executionMode}</span></div>
+                        <div className='ov-cell' style={{ gridColumn: 'span 1 / -1' }}><span className='k' />
+                            <Tag style={{ borderRadius: 999 }}>Output: {summary.outputFormat}</Tag>
+                        </div>
+                        <div className='ov-cell'><span className='k'>Slug</span><span className='v'><code>{instance.slug}</code></span></div>
+                        <div className='ov-cell'><span className='k'>Labels</span><span className='v'>{resolvedLabels.length ? <Tag color='purple'>{resolvedLabels.length} defined</Tag> : <Tag color='default'>(none defined)</Tag>}</span></div>
+                        <div className='ov-cell'>
+                            <span className='k'>Updated</span>
+                            <span className='v'>
+                                {instance.updatedAt ? new Date(instance.updatedAt).toLocaleDateString() : '—'}
+                                {typeof (instance as any).createdBy === 'string' ? ` · by ${(instance as any).createdBy}` : ''}
+                            </span>
+                        </div>
+                        <div className='ov-cell'><span className='k'>API URL</span><span className='v'>{summary.apiUrl || <Text type='secondary' italic>infer from provider</Text>}</span></div>
+                    </div>
+                </div>
+
+                <div className='drawer-section'>
+                    <div className='drawer-section-title'><ApiOutlined /> Labels & attributes · {resolvedLabels.length} total</div>
+                    {instance.featureKind === 'image_caption' ? (
+                        <AlertRow
+                            type='info'
+                            title='Caption flow — no per-object labels'
+                            desc={
+                                <>
+                                    Image caption instances store a single image-level TAG attribute named{' '}
+                                    <Tag color='cyan'>{summary.captionAttrName || 'caption'}</Tag>.
+                                    You can define extra fallback labels via <strong>Advanced → Labels & Attributes</strong> in Edit mode.
+                                </>
+                            }
+                        />
+                    ) : resolvedLabels.length === 0 ? (
+                        <AlertRow
+                            type='warning'
+                            title='No labels resolved'
+                            desc='Edit this instance to define labels directly, choose a preset, or supply preset_labels+ascii_labels in the raw config JSON.'
+                        />
+                    ) : (
+                        <div className='labels-list'>
+                            {resolvedLabels.slice(0, labelCountShow).map((lb, idx) => (
+                                <div className='label-item' key={`${lb.name}-${idx}`}>
+                                    <div className='label-name'>
+                                        <Text strong>{idx + 1}. {lb.name}</Text>
+                                        {lb.type && lb.type !== 'rectangle' ? <Tag style={{ marginLeft: 6 }}>{lb.type}</Tag> : null}
+                                    </div>
+                                    <div className='label-meta'>
+                                        {lb.description ? (
+                                            <Text type='secondary'>{lb.description}</Text>
+                                        ) : (
+                                            <Text type='secondary' italic>No description.</Text>
+                                        )}
+                                        {Array.isArray(lb.attributes) && lb.attributes.length > 0 ? (
+                                            <div style={{ marginTop: 6 }}>
+                                                <Text type='secondary' strong>Attributes: </Text>
+                                                {lb.attributes.map((attr: any) => (
+                                                    <Tag key={String(attr?.name || idx)} style={{ marginBottom: 4 }}>
+                                                        <code>{String(attr?.name || 'unnamed-attr')}</code>
+                                                        {attr?.type ? ` · ${String(attr.type)}` : ''}
+                                                        {attr?.description ? ` — ${String(attr.description)}` : ''}
+                                                    </Tag>
+                                                ))}
+                                            </div>
+                                        ) : (
+                                            <div style={{ marginTop: 4 }}>
+                                                <Tag color='default' style={{ fontStyle: 'italic' }}>No attributes</Tag>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            ))}
+                            {resolvedLabels.length > labelCountShow ? (
+                                <div className='show-more-row'>
+                                    <Button
+                                        size='small'
+                                        onClick={() => setLabelCountShow(labelCountShow + 8)}
+                                        icon={<DownOutlined />}
+                                    >
+                                        Show {Math.min(8, resolvedLabels.length - labelCountShow)} more labels
+                                    </Button>
+                                    <Button size='small' style={{ marginLeft: 8 }} onClick={() => setLabelCountShow(resolvedLabels.length)}>
+                                        Expand all ({resolvedLabels.length})
+                                    </Button>
+                                </div>
+                            ) : labelCountShow > 3 ? (
+                                <div className='show-more-row'>
+                                    <Button size='small' onClick={() => setLabelCountShow(3)} icon={<UpOutlined />}>Collapse to 3</Button>
+                                </div>
+                            ) : null}
+                        </div>
+                    )}
+                </div>
+
+                <div className='drawer-section'>
+                    <div className='drawer-section-title'>
+                        <FileTextOutlined /> Prompt templates
+                        <Tag style={{ marginLeft: 12, borderRadius: 999 }}>System {summary.systemPromptLen.toLocaleString()} chars · User {summary.userPromptLen.toLocaleString()} chars</Tag>
+                        {summary.systemPromptLen > 4000 ? <Tag color='orange' style={{ borderRadius: 999 }}>Long prompt (>4000 chars)</Tag> : null}
+                    </div>
+                    {!summary.systemPromptLen && !summary.userPromptLen ? (
+                        <AlertRow
+                            type='warning'
+                            title='No prompt templates configured'
+                            desc='Most VLM providers fall back to reasonable defaults, but explicit prompts are recommended for stable output.'
+                        />
+                    ) : (
+                        <Space direction='vertical' style={{ width: '100%' }} size={10}>
+                            <div className='prompt-panel'>
+                                <div className='prompt-head'>
+                                    <div className='prompt-title'>System prompt template</div>
+                                    <div className='prompt-actions'>
+                                        {summary.systemPromptLen > 0 ? (
+                                            <Button
+                                                size='small'
+                                                icon={<CopyOutlined />}
+                                                onClick={() => {
+                                                    toClipboard(resolvedPromptTemplates.sys || '').then(() => {
+                                                        notification.success({ message: 'System prompt copied to clipboard' });
+                                                    }).catch(() => {});
+                                                }}
+                                            >
+                                                Copy
+                                            </Button>
+                                        ) : null}
+                                        {promptsExpanded ? (
+                                            <Button size='small' icon={<UpOutlined />} onClick={() => setPromptsExpanded(false)}>Collapse</Button>
+                                        ) : (
+                                            <Button size='small' icon={<ExpandOutlined />} onClick={() => setPromptsExpanded(true)} disabled={!summary.systemPromptLen && !summary.userPromptLen}>Expand</Button>
+                                        )}
+                                    </div>
+                                </div>
+                                {(promptsExpanded || summary.systemPromptLen < 1500) && summary.systemPromptLen > 0 ? (
+                                    <div className='prompt-body'><pre>{resolvedPromptTemplates.sys}</pre></div>
+                                ) : !summary.systemPromptLen ? (
+                                    <div className='prompt-body'>
+                                        <Text type='secondary' italic>Empty (uses server default).</Text>
+                                    </div>
+                                ) : null}
+                            </div>
+                            <div className='prompt-panel'>
+                                <div className='prompt-head'>
+                                    <div className='prompt-title'>User prompt template (per-image)</div>
+                                    <div className='prompt-actions'>
+                                        {summary.userPromptLen > 0 ? (
+                                            <Button
+                                                size='small'
+                                                icon={<CopyOutlined />}
+                                                onClick={() => {
+                                                    toClipboard(resolvedPromptTemplates.usr || '').then(() => {
+                                                        notification.success({ message: 'User prompt copied to clipboard' });
+                                                    }).catch(() => {});
+                                                }}
+                                            >
+                                                Copy
+                                            </Button>
+                                        ) : null}
+                                    </div>
+                                </div>
+                                {(promptsExpanded || summary.userPromptLen < 1500) && summary.userPromptLen > 0 ? (
+                                    <div className='prompt-body'><pre>{resolvedPromptTemplates.usr}</pre></div>
+                                ) : !summary.userPromptLen ? (
+                                    <div className='prompt-body'>
+                                        <Text type='secondary' italic>Empty (uses server default).</Text>
+                                    </div>
+                                ) : null}
+                            </div>
+                        </Space>
+                    )}
+                </div>
+
+                <div className='drawer-section'>
+                    <div className='drawer-section-title'><SettingOutlined /> Advanced · API & execution details, parser tuning, full JSON (click to expand)</div>
+                    <Collapse
+                        bordered={false}
+                        activeKey={rawExpanded ? ['adv'] : []}
+                        onChange={(k) => setRawExpanded(Array.isArray(k) && k.includes('adv'))}
+                        items={[{
+                            key: 'adv',
+                            label: (
+                                <Space size={[8, 8]} wrap>
+                                    <Tag color='blue'>parser: {summary.parserConfigEntries} keys</Tag>
+                                    {summary.unknownExtraKeys.length ? <Tag color='purple'>extra: {summary.unknownExtraKeys.length}</Tag> : null}
+                                    {summary.hasApiKey ? <Tag color='green'>has_api_key: yes</Tag> : <Tag color='red'>has_api_key: no</Tag>}
+                                </Space>
+                            ),
+                            children: (
+                                <Space direction='vertical' style={{ width: '100%' }} size={12}>
+                                    <div>
+                                        <Divider orientation='left' plain style={{ margin: '4px 0 10px' }}>API & execution (from instance.config + sensitive)</Divider>
+                                        <Space direction='vertical' style={{ width: '100%' }} size={4}>
+                                            {cfg.api_url ? <Tag color='geekblue'><CodeOutlined /> api_url = <code>{String(cfg.api_url)}</code></Tag> : null}
+                                            {summary.model ? <Tag color='geekblue'><CodeOutlined /> model = <code>{String(cfg.model)}</code></Tag> : null}
+                                            {cfg.execution_mode ? <Tag color='geekblue'><CodeOutlined /> execution_mode = <code>{String(cfg.execution_mode)}</code></Tag> : null}
+                                            {cfg.local_backend ? <Tag color='green'><CodeOutlined /> local_backend = <code>{String(cfg.local_backend)}</code></Tag> : null}
+                                            {cfg.http_file_field ? <Tag color='green'><CodeOutlined /> http_file_field = <code>{String(cfg.http_file_field)}</code></Tag> : null}
+                                            {cfg.http_form_fields ? <Tag color='green'><CodeOutlined /> http_form_fields = <code>{typeof cfg.http_form_fields === 'string' ? cfg.http_form_fields : JSON.stringify(cfg.http_form_fields)}</code></Tag> : null}
+                                            {cfg.output_format ? <Tag color='geekblue'><CodeOutlined /> output_format = <code>{String(cfg.output_format)}</code></Tag> : null}
+                                            {cfg.preset_id ? <Tag color='purple'>preset_id = <code>{String(cfg.preset_id)}</code></Tag> : null}
+                                            {summary.unknownExtraKeys.length > 0 ? (
+                                                <Tooltip title={summary.unknownExtraKeys.join(', ')}>
+                                                    <Tag color='purple'>
+                                                        Unknown/extra config keys ({summary.unknownExtraKeys.length}):{' '}
+                                                        {summary.unknownExtraKeys.slice(0, 4).join(', ')}
+                                                        {summary.unknownExtraKeys.length > 4 ? ` …` : ''}
+                                                    </Tag>
+                                                </Tooltip>
+                                            ) : null}
+                                        </Space>
+                                    </div>
+                                    <div>
+                                        <Divider orientation='left' plain style={{ margin: '4px 0 10px' }}>Parser config (output_parser_config)</Divider>
+                                        {summary.parserConfigEntries > 0 ? (
+                                            <div className='raw-panel'><pre>{JSON.stringify(cfg.output_parser_config || {}, null, 2)}</pre></div>
+                                        ) : (
+                                            <Empty description='No explicit parser config — engine defaults will be used.' />
+                                        )}
+                                    </div>
+                                    <div>
+                                        <Divider orientation='left' plain style={{ margin: '4px 0 10px' }}>Full raw instance (sanitized)</Divider>
+                                        <div className='raw-panel'><pre>{JSON.stringify({
+                                            id: instance.id,
+                                            slug: instance.slug,
+                                            name: instance.name,
+                                            featureKind: instance.featureKind,
+                                            provider: instance.provider,
+                                            isEnabled: instance.isEnabled,
+                                            isDefault: instance.isDefault,
+                                            createdAt: instance.createdAt,
+                                            updatedAt: instance.updatedAt,
+                                            createdBy: (instance as any).createdBy,
+                                            updatedBy: (instance as any).updatedBy,
+                                            config: instance.config,
+                                            resolvedLabels,
+                                            resolvedSummary: summary,
+                                            sensitiveExposed: Object.fromEntries(
+                                                Object.entries(hasSens || {}).map(([k, v]) => [k, typeof v === 'boolean' ? v : (v ? `(${typeof v})` : v)])
+                                            ),
+                                        }, null, 2)}</pre></div>
+                                    </div>
+                                </Space>
+                            ),
+                        }]}
+                    />
+                </div>
+            </Drawer>
+        </>
+    );
+}
+
+function AlertRow(props: { type: 'info' | 'warning' | 'error'; title: React.ReactNode; desc: React.ReactNode }): JSX.Element {
+    const colors = {
+        info: { border: '#91caff', bg: '#e6f4ff', text: '#0958d9', icon: <CheckCircleOutlined /> },
+        warning: { border: '#ffe58f', bg: '#fffbe6', text: '#d48806', icon: <SafetyOutlined /> },
+        error:   { border: '#ffccc7', bg: '#fff2f0', text: '#cf1322', icon: <RightOutlined /> },
+    } as const;
+    const c = colors[props.type];
+    return (
+        <div style={{ padding: 12, borderRadius: 8, borderLeft: `3px solid ${c.border}`, background: c.bg }}>
+            <Space size={[8, 8]} align='start'>
+                <span style={{ color: c.text }}>{c.icon}</span>
+                <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: c.text, marginBottom: 2 }}>{props.title}</div>
+                    <div style={{ fontSize: 12.5, color: 'rgba(0,0,0,0.75)' }}>{props.desc}</div>
+                </div>
+            </Space>
+        </div>
+    );
+}

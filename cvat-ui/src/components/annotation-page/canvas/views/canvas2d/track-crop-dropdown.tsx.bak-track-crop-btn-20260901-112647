@@ -1,0 +1,176 @@
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useDispatch } from 'react-redux';
+import Button from 'antd/lib/button';
+import Dropdown from 'antd/lib/dropdown';
+import InputNumber from 'antd/lib/input-number';
+import Modal from 'antd/lib/modal';
+import Space from 'antd/lib/space';
+import Text from 'antd/lib/typography/Text';
+import { DownOutlined } from '@ant-design/icons';
+
+import { truncateTrackAsync } from 'actions/annotation-actions';
+import { ObjectState, ObjectType } from 'cvat-core-wrapper';
+
+interface Props {
+    objectState: ObjectState | null;
+    frame: number;
+    startFrame: number;
+    stopFrame: number;
+}
+
+function labelAnchor(clientID: number): DOMRect | null {
+    const text = window.document.querySelector(
+        `#cvat_canvas_text_content [data-client-id="${clientID}"]`,
+    ) as SVGGraphicsElement | null;
+    if (text) {
+        return text.getBoundingClientRect();
+    }
+    const shape = window.document.getElementById(`cvat_canvas_shape_${clientID}`);
+    return shape ? shape.getBoundingClientRect() : null;
+}
+
+export default function TrackCropDropdown(props: Props): JSX.Element | null {
+    const { objectState, frame, startFrame, stopFrame } = props;
+    const dispatch = useDispatch();
+    const [anchor, setAnchor] = useState<{ top: number; left: number } | null>(null);
+
+    const isTrack = objectState?.objectType === ObjectType.TRACK &&
+        Number.isInteger(objectState.clientID) &&
+        !objectState.lock &&
+        !objectState.isGroundTruth;
+
+    const updateAnchor = useCallback((): void => {
+        if (!isTrack || objectState?.clientID == null) {
+            setAnchor(null);
+            return;
+        }
+        const box = labelAnchor(objectState.clientID);
+        if (!box || (box.width === 0 && box.height === 0)) {
+            setAnchor(null);
+            return;
+        }
+        setAnchor({
+            top: box.top,
+            left: box.right + 4,
+        });
+    }, [isTrack, objectState?.clientID]);
+
+    useEffect(() => {
+        updateAnchor();
+        const onScroll = (): void => updateAnchor();
+        window.addEventListener('resize', onScroll);
+        const canvas = window.document.querySelector('.cvat-canvas-container');
+        canvas?.addEventListener('scroll', onScroll, true);
+        canvas?.addEventListener('wheel', onScroll, true);
+        const timer = window.setInterval(updateAnchor, 250);
+        return () => {
+            window.removeEventListener('resize', onScroll);
+            canvas?.removeEventListener('scroll', onScroll, true);
+            canvas?.removeEventListener('wheel', onScroll, true);
+            window.clearInterval(timer);
+        };
+    }, [updateAnchor, frame]);
+
+    const firstKeyframe = objectState?.keyframes?.first ?? startFrame;
+
+    const confirmTruncate = useCallback((fromFrame: number): void => {
+        if (!objectState) return;
+        const removesAll = fromFrame <= firstKeyframe;
+        Modal.confirm({
+            title: removesAll ? 'Remove entire track' : `Delete track from frame ${fromFrame}`,
+            content: removesAll ? (
+                <Text>
+                    Frame {fromFrame} is at or before the first keyframe, so the whole track will be removed.
+                </Text>
+            ) : (
+                <Text>
+                    Keep this object on frames before {fromFrame}. Remove it from frame {fromFrame} to the end of the job.
+                    Grouped shapes (for example VanCar + keypoints + Rear) are truncated together.
+                </Text>
+            ),
+            okText: removesAll ? 'Remove track' : 'Delete from this frame',
+            okType: 'danger',
+            cancelText: 'Cancel',
+            className: 'cvat-modal-confirm-truncate-track',
+            onOk: () => dispatch(truncateTrackAsync(objectState, fromFrame)),
+        });
+    }, [dispatch, firstKeyframe, objectState]);
+
+    const openCustomFrame = useCallback((): void => {
+        let nextFrame = frame;
+        Modal.confirm({
+            title: 'Delete track from a chosen frame',
+            className: 'cvat-modal-confirm-truncate-track-frame',
+            content: (
+                <Space direction='vertical'>
+                    <Text>Object disappears from this frame onwards. Earlier frames are kept.</Text>
+                    <InputNumber
+                        min={startFrame}
+                        max={stopFrame}
+                        defaultValue={frame}
+                        onChange={(value) => {
+                            if (typeof value === 'number') nextFrame = value;
+                        }}
+                    />
+                </Space>
+            ),
+            okText: 'Delete',
+            okType: 'danger',
+            cancelText: 'Cancel',
+            onOk: () => {
+                if (typeof nextFrame !== 'number' || nextFrame < startFrame || nextFrame > stopFrame) {
+                    return Promise.reject();
+                }
+                confirmTruncate(nextFrame);
+                return Promise.resolve();
+            },
+        });
+    }, [confirmTruncate, frame, startFrame, stopFrame]);
+
+    const menu = useMemo(() => ({
+        className: 'cvat-track-crop-dropdown-menu',
+        items: [
+            {
+                key: 'from-here',
+                danger: true,
+                label: `Delete from frame ${frame} onwards`,
+            },
+            {
+                key: 'from-custom',
+                label: 'Delete from a chosen frame…',
+            },
+        ],
+        onClick: ({ key }: { key: string }) => {
+            if (key === 'from-here') confirmTruncate(frame);
+            if (key === 'from-custom') openCustomFrame();
+        },
+    }), [confirmTruncate, frame, openCustomFrame]);
+
+    if (!isTrack || !anchor) {
+        return null;
+    }
+
+    return (
+        <div
+            className='cvat-track-crop-dropdown'
+            style={{ top: anchor.top, left: anchor.left }}
+        >
+            <Dropdown trigger={['click']} menu={menu} placement='bottomLeft'>
+                <Button
+                    size='small'
+                    type='primary'
+                    className='cvat-track-crop-dropdown-button'
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onClick={(event) => event.stopPropagation()}
+                >
+                    Track
+                    <DownOutlined />
+                </Button>
+            </Dropdown>
+        </div>
+    );
+}

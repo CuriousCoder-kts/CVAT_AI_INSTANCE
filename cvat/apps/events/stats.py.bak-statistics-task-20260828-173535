@@ -1,0 +1,213 @@
+# Copyright (C) CVAT.ai Corporation
+#
+# SPDX-License-Identifier: MIT
+
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import clickhouse_connect
+from dateutil import parser
+from django.conf import settings
+from rest_framework import serializers
+
+from cvat.apps.engine.log import ServerLogManager
+
+slogger = ServerLogManager(__name__)
+
+CREATE_SCOPES = ("create:shapes", "create:tags", "create:tracks")
+WORKING_TIME_SCOPE = "send:working_time"
+SCOPE_TO_FIELD = {
+    "create:shapes": "shapes",
+    "create:tags": "tags",
+    "create:tracks": "tracks",
+}
+
+
+def _as_int(value: Any) -> int | None:
+    if value in (None, "", "None", "null"):
+        return None
+    return int(value)
+
+
+def _parse_bounds(query_params: dict[str, Any]) -> tuple[datetime, datetime]:
+    raw_from = query_params.get("from")
+    raw_to = query_params.get("to")
+    now = datetime.now(timezone.utc)
+
+    try:
+        dt_from = parser.isoparse(raw_from) if raw_from else now - timedelta(days=30)
+        dt_to = parser.isoparse(raw_to) if raw_to else now
+    except parser.ParserError as exc:
+        raise serializers.ValidationError(f"Cannot parse datetime parameter: {exc}") from exc
+
+    if dt_from.tzinfo is None:
+        dt_from = dt_from.replace(tzinfo=timezone.utc)
+    if dt_to.tzinfo is None:
+        dt_to = dt_to.replace(tzinfo=timezone.utc)
+
+    if dt_from > dt_to:
+        raise serializers.ValidationError("'from' must be before than 'to'")
+
+    return dt_from, dt_to
+
+
+def _clickhouse_client():
+    clickhouse_settings = settings.CLICKHOUSE["events"]
+    return clickhouse_connect.get_client(
+        host=clickhouse_settings["HOST"],
+        database=clickhouse_settings["NAME"],
+        port=clickhouse_settings["PORT"],
+        username=clickhouse_settings["USER"],
+        password=clickhouse_settings["PASSWORD"],
+        tz_mode="schema",
+    )
+
+
+def _common_filters(query_params: dict[str, Any], dt_from: datetime, dt_to: datetime):
+    conditions = [
+        "user_id IS NOT NULL",
+        "timestamp >= {from:DateTime64}",
+        "timestamp <= {to:DateTime64}",
+    ]
+    parameters: dict[str, Any] = {
+        "from": dt_from,
+        "to": dt_to,
+    }
+
+    org_id = _as_int(query_params.get("org_id"))
+    user_id = _as_int(query_params.get("user_id"))
+    project_id = _as_int(query_params.get("project_id"))
+
+    if org_id is not None:
+        conditions.append("org_id = {org_id:UInt64}")
+        parameters["org_id"] = org_id
+    if user_id is not None:
+        conditions.append("user_id = {user_id:UInt64}")
+        parameters["user_id"] = user_id
+    if project_id is not None:
+        conditions.append("project_id = {project_id:UInt64}")
+        parameters["project_id"] = project_id
+
+    return " AND ".join(conditions), parameters
+
+
+def empty_statistics(dt_from: datetime, dt_to: datetime, message: str | None = None) -> dict:
+    payload = {
+        "available": not bool(message),
+        "from": dt_from.isoformat(),
+        "to": dt_to.isoformat(),
+        "users": [],
+        "daily": [],
+        "totals": {
+            "annotations": 0,
+            "users": 0,
+            "working_ms": 0,
+        },
+    }
+    if message:
+        payload["message"] = message
+        payload["available"] = False
+    return payload
+
+
+def query_annotation_statistics(query_params: dict[str, Any]) -> dict:
+    dt_from, dt_to = _parse_bounds(query_params)
+    where_sql, parameters = _common_filters(query_params, dt_from, dt_to)
+
+    try:
+        with _clickhouse_client() as client:
+            by_scope = client.query(
+                f"""
+                SELECT user_id, any(user_name) AS user_name, scope,
+                       sum(ifNull(count, toUInt64(1))) AS total
+                FROM events
+                WHERE scope IN ('create:shapes', 'create:tags', 'create:tracks')
+                  AND {where_sql}
+                GROUP BY user_id, scope
+                """,
+                parameters=parameters,
+            )
+            daily = client.query(
+                f"""
+                SELECT toDate(timestamp) AS day, sum(ifNull(count, toUInt64(1))) AS total
+                FROM events
+                WHERE scope IN ('create:shapes', 'create:tags', 'create:tracks')
+                  AND {where_sql}
+                GROUP BY day
+                ORDER BY day ASC
+                """,
+                parameters=parameters,
+            )
+            working = client.query(
+                f"""
+                SELECT user_id, any(user_name) AS user_name,
+                       sum(if(duration > 0, duration, JSONExtractUInt(ifNull(payload, ''), 'working_time'))) AS working_ms
+                FROM events
+                WHERE scope = '{WORKING_TIME_SCOPE}'
+                  AND {where_sql}
+                GROUP BY user_id
+                """,
+                parameters=parameters,
+            )
+    except Exception:
+        slogger.glob.exception("Failed to query annotation statistics from ClickHouse")
+        return empty_statistics(
+            dt_from,
+            dt_to,
+            "Events database is unavailable. Annotation statistics cannot be loaded.",
+        )
+
+    users: dict[int, dict] = {}
+
+    def ensure_user(user_id: int, user_name: str | None) -> dict:
+        if user_id not in users:
+            users[user_id] = {
+                "id": user_id,
+                "name": user_name or f"user-{user_id}",
+                "shapes": 0,
+                "tags": 0,
+                "tracks": 0,
+                "working_ms": 0,
+            }
+        elif user_name and users[user_id]["name"].startswith("user-"):
+            users[user_id]["name"] = user_name
+        return users[user_id]
+
+    for user_id, user_name, scope, total in by_scope.result_rows:
+        row = ensure_user(int(user_id), user_name)
+        field = SCOPE_TO_FIELD.get(scope)
+        if field:
+            row[field] = int(total or 0)
+
+    for user_id, user_name, working_ms in working.result_rows:
+        row = ensure_user(int(user_id), user_name)
+        row["working_ms"] = int(working_ms or 0)
+
+    user_list = sorted(
+        users.values(),
+        key=lambda item: item["shapes"] + item["tags"] + item["tracks"],
+        reverse=True,
+    )
+    for item in user_list:
+        item["annotations"] = item["shapes"] + item["tags"] + item["tracks"]
+
+    daily_list = [
+        {"date": str(day), "count": int(total or 0)}
+        for day, total in daily.result_rows
+    ]
+
+    annotations = sum(item["annotations"] for item in user_list)
+    working_ms = sum(item["working_ms"] for item in user_list)
+
+    return {
+        "available": True,
+        "from": dt_from.isoformat(),
+        "to": dt_to.isoformat(),
+        "users": user_list,
+        "daily": daily_list,
+        "totals": {
+            "annotations": annotations,
+            "users": len(user_list),
+            "working_ms": working_ms,
+        },
+    }

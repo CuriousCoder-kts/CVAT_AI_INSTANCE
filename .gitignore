@@ -1,0 +1,193 @@
+# ========================================
+# Python / Django
+# ========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Django
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+django_static/
+media/
+cvat/data/
+data/
+
+# Testing / Coverage
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.tox/
+.nox/
+
+# ========================================
+# Node.js / React / TypeScript
+# ========================================
+node_modules/
+dist/
+build/
+out/
+.next/
+.nuxt/
+.vuepress/dist/
+.serverless/
+.fusebox/
+.dynamodb/
+.parcel-cache/
+.eslintcache
+.stylelintcache
+
+# Yarn / npm
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
+.yarn/cache/
+.yarn/install-state.gz
+.pnp.*
+.npm
+.eslintcache
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# TypeScript build info
+*.tsbuildinfo
+*.tsbuildinfo
+
+# ========================================
+# Docker
+# ========================================
+.docker-data/
+.docker-volumes/
+volumes/
+docker-compose.override.yml
+
+# ========================================
+# IDE / Editor
+# ========================================
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# ========================================
+# Environment / Secrets
+# ========================================
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+*.pem
+*.key
+*.crt
+secrets/
+credentials.json
+service_account.json
+
+# ========================================
+# Operating System
+# ========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ========================================
+# CVAT specific
+# ========================================
+cvat/data/*
+!cvat/data/.gitkeep
+cvat/apps/engine/static/engine/
+cvat-core/dist/
+cvat-canvas/dist/
+cvat-canvas3d/dist/
+cvat-data/dist/
+cvat-ui/dist/
+cvat-sdk/dist/
+cvat-cli/dist/
+cvat-cli/build/
+cvat-sdk/build/
+
+# Nuclio / Serverless functions temp
+serverless/*/build/
+serverless/*/dist/
+
+# Site / Docs build artifacts
+site/public/
+site/resources/
+
+# Helm chart temp
+helm-chart/tmp/
+
+# ========================================
+# Session history / Internal docs
+# ========================================
+SESSION_HISTORY_AGG_*.md
+session_memory_*.jsonl
+
+# ========================================
+# Misc
+# ========================================
+*.bak
+*.backup
+*.tmp
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z

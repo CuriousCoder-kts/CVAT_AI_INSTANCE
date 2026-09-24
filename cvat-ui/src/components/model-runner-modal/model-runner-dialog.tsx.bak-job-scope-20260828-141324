@@ -1,0 +1,451 @@
+// Copyright (C) 2020-2022 Intel Corporation
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+import './styles.scss';
+import React, { useEffect, useState } from 'react';
+import { connect } from 'react-redux';
+import Modal from 'antd/lib/modal';
+import notification from 'antd/lib/notification';
+
+import { ThunkDispatch } from 'utils/redux';
+import { modelsActions, startInferenceAsync } from 'actions/models-actions';
+import CVATLoadingSpinner from 'components/common/loading-spinner';
+import { CombinedState } from 'reducers';
+import MLModel from 'cvat-core/src/ml-model';
+import { SerializedModel } from 'cvat-core/src/core-types';
+import {
+    getCore, Task, AIFunctionInstance, ModelKind, Organization, LabelType, ModelProviders,
+} from 'cvat-core-wrapper';
+import DetectorRunner from './detector-runner';
+import { bcResolveLabelSpec } from 'components/ai-feature-page/instance-card';
+
+const core = getCore();
+
+const AI_FEATURE_KIND = {
+    OBJECT_DETECTOR: 'object_detector',
+    INTENTION_ESTIMATION: 'intention_estimation',
+    IMAGE_CAPTION: 'image_caption',
+    POSE_ESTIMATION: 'pose_estimation',
+} as const;
+
+const BAILIAN_DEFAULT_LABELS = [
+    'pedestrian', 'cyclist', 'motor_vehicle', 'non_motor_vehicle',
+    'traffic_cone', 'traffic_bucket', 'traffic_column',
+    'plastic_barrier', 'guard_rail',
+] as const;
+
+// 判断字符串是否包含中日韩表意字符（CJK Unified Ideographs 基本区 + 扩展 A）
+// 用于自动 fallback 到 slug，避免 UI 上出现中文（用户强约束：前端所有可见字全英文）
+function containsCJKChars(s: string): boolean {
+    return typeof s === 'string' && /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(s);
+}
+
+// 取 AI Instance 的「安全英文 display 名」：优先 displayName/name/slug，但含 CJK 时直接 fallback slug
+function safeEnglishInstanceName(inst: AIFunctionInstance): string {
+    const base = inst.displayName ?? inst.name ?? inst.slug;
+    if (containsCJKChars(String(base || ''))) {
+        return inst.slug ?? base;
+    }
+    return String(base);
+}
+
+// Bug Fix MAPPER-1 (辅助 stableColorForLabelName)：
+//   AI Instance 的 labels 可能用户没配置 color（只有 name/type），
+//   导致 getObjectColor() 返回 undefined → Setup mapping 左列 Tag 背景色纯白透明 + 文字不可见
+//   (就是用户截图里前 3 行 cyclist/motor_vehicle/pedestrian"左侧空白看不见"的根因)，
+//   同时 Models 页 Labels Tags 区也是一片灰/占位 SVG。
+// 解决方案：label name 字符串 → BKDR hash → HSL(0-360, 68%, 52%) 转 #RRGGBB，同名 label 颜色稳定。
+function stableColorForLabelName(name: string): string {
+    const s = String(name || '').trim() || 'unnamed-label';
+    // FNV-1a 32-bit hash (fewer collisions than simple sum)
+    let h = 0x811c9dc5 >>> 0;
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    h = (h >>> 0);
+    const hue = h % 360;
+    const S = 0.68;
+    const L = 0.52;
+    // inline HSL → RGB (avoid external dep)
+    const hue2rgb = (p: number, q: number, t: number): number => {
+        let tt = t;
+        if (tt < 0) tt += 1;
+        if (tt > 1) tt -= 1;
+        if (tt < 1 / 6) return p + (q - p) * 6 * tt;
+        if (tt < 1 / 2) return q;
+        if (tt < 2 / 3) return p + (q - p) * (2 / 3 - tt) * 6;
+        return p;
+    };
+    let r: number; let g: number; let b: number;
+    if (S === 0) {
+        r = L; g = L; b = L;
+    } else {
+        const q = L < 0.5 ? L * (1 + S) : L + S - L * S;
+        const p = 2 * L - q;
+        const H = hue / 360;
+        r = hue2rgb(p, q, H + 1 / 3);
+        g = hue2rgb(p, q, H);
+        b = hue2rgb(p, q, H - 1 / 3);
+    }
+    const hex = (v: number) => {
+        const n = Math.max(0, Math.min(255, Math.round(v * 255)));
+        return n.toString(16).padStart(2, '0');
+    };
+    return `#${hex(r)}${hex(g)}${hex(b)}`;
+}
+
+export function resolveAILabels(inst: AIFunctionInstance): Array<{
+    name: string; type: LabelType; attributes: any[]; color?: string;
+}> {
+    const config = (inst as any)?.config;
+    // HIGHEST PRIORITY: bcResolveLabelSpec 统一 3 种历史格式（新 labels[] / legacy preset_labels+ascii_labels+attributes_per_label / spec.labels）
+    const unifiedLabels = bcResolveLabelSpec(config);
+    const instLabels = unifiedLabels.length ? unifiedLabels :
+        (config && Array.isArray(config?.spec?.labels) && config.spec.labels.length ? config.spec.labels : null);
+
+    if (instLabels) {
+        return instLabels.map((x: any) => {
+            const n = String(x.name ?? x.label ?? x).trim();
+            const explicitColor = typeof x.color === 'string' && x.color;
+            return {
+                name: n,
+                type: (x.type as LabelType) ?? LabelType.RECTANGLE,
+                attributes: Array.isArray(x.attributes) ? x.attributes : [],
+                color: explicitColor || stableColorForLabelName(n),
+            };
+        }).filter((x: any) => x.name);
+    }
+
+    const kind = (inst.featureKind ?? '').toLowerCase();
+    // ===== IMAGE_CAPTION: returns a single TAG-type label (name matches caption_attribute_name)
+    // ===== mapped to backend output_parser_config.caption_attribute_name
+    if (kind === AI_FEATURE_KIND.IMAGE_CAPTION) {
+        let attrName: string = 'caption';
+        try {
+            const cfg = config || {};
+            const opc = cfg.output_parser_config || {};
+            if (typeof opc.caption_attribute_name === 'string' && opc.caption_attribute_name.trim()) {
+                attrName = opc.caption_attribute_name.trim();
+            }
+        } catch {
+            /* use default */
+        }
+        return [{
+            name: attrName,
+            type: LabelType.TAG,
+            attributes: [{
+                name: attrName,
+                input_type: 'text',
+                mutable: true,
+                values: [],
+                default_value: '',
+            }],
+            color: stableColorForLabelName(attrName),
+        }];
+    }
+
+    const nameNorm = (inst.name ?? inst.slug ?? '').toLowerCase();
+    if (kind === AI_FEATURE_KIND.OBJECT_DETECTOR && (
+        nameNorm.includes('bailian') || nameNorm.includes('qwen') ||
+        String(inst.provider ?? '').toLowerCase().includes('bailian')
+    )) {
+        return BAILIAN_DEFAULT_LABELS.map((n) => ({
+            name: n,
+            type: LabelType.RECTANGLE,
+            attributes: [],
+            color: stableColorForLabelName(n),
+        }));
+    }
+    return [];
+}
+
+export function wrapAIInstanceAsModel(inst: AIFunctionInstance): MLModel {
+    const kindStr = inst.featureKind;
+    const mapKind: Record<string, string> = {
+        [AI_FEATURE_KIND.OBJECT_DETECTOR]: ModelKind.DETECTOR,
+        [AI_FEATURE_KIND.INTENTION_ESTIMATION]: ModelKind.REID,
+        [AI_FEATURE_KIND.IMAGE_CAPTION]: ModelKind.DETECTOR,
+        [AI_FEATURE_KIND.POSE_ESTIMATION]: ModelKind.DETECTOR,
+    };
+    const mappedKind = (mapKind as any)[kindStr] ?? ModelKind.DETECTOR;
+    // 强制使用安全英文名（任何 CJK 字符 → 用 slug）保证下拉框/卡片 0 中文
+    const nameFallback = safeEnglishInstanceName(inst);
+    const defaultSuffix = inst.isDefault ? ' (Default)' : '';
+    // 下拉框里的展示名，必须纯英文 + Provider/Kind 后缀
+    const realProvider = (inst as any)?.provider || 'bailian';
+    const displayName = `[AI Instance${defaultSuffix}] ${nameFallback} (${realProvider} · ${inst.featureKind})`;
+    const fakeId = `__ai_instance__${inst.id}__slug__${inst.slug}`;
+    const labels = resolveAILabels(inst);
+    const ownerName = (inst as any)?.owner?.username ||
+        (inst as any)?.owner?.name ||
+        (inst as any)?.created_by ||
+        (inst as any)?.updated_by ||
+        'admin';
+    const created = (inst as any)?.createdDate || (inst as any)?.created_at || new Date().toISOString();
+    const updated = (inst as any)?.updatedDate || (inst as any)?.updated_at || new Date().toISOString();
+    // Models 页 deployed-model-item.tsx L105 逻辑：
+    //   model.provider !== ModelProviders.CVAT → "#${model.id}: ${model.name}"
+    // 之前 provider=bailian → 前缀 "fakeId" 直接把 name 挤爆了，导致卡片显示破相
+    // 修复：serialized.provider=ModelProviders.CVAT → 不显示 #id 前缀，name 就是完整的 displayName
+    // 真实 provider 仍然透传给外部，放在 _realProvider 字段，Model Runner Dialog / meta 都用 _realProvider
+    const serialized: SerializedModel & { [k: string]: any } = {
+        id: fakeId,
+        name: displayName,
+        kind: mappedKind,
+        labels_v2: labels,
+        version: (inst as any)?.version || 1,
+        provider: ModelProviders.CVAT as any,
+        owner: { username: ownerName },
+        created_date: created,
+        updated_date: updated,
+        url: (inst as any)?.url || undefined,
+        description: `AI Function Instance [${inst.slug}]` +
+            (inst.description ? ` — ${inst.description}` : '') +
+            ` (Provider: ${realProvider}, Feature: ${inst.featureKind})`,
+        help_message: (inst as any)?.help_message ||
+            `Model supplied by AI Function Instance manager. Provider: ${realProvider}`,
+        animated_gif: (inst as any)?.preview_url || (inst as any)?.animated_gif || undefined,
+        _isAIInstance: true,
+        _aiInstanceSlug: inst.slug,
+        _aiInstanceID: inst.id,
+        _aiInstanceDefault: !!inst.isDefault,
+        _aiInstanceObject: inst,
+        _realProvider: realProvider,
+        _aiFeatureKind: inst.featureKind,
+    };
+    const ml = new MLModel(serialized) as MLModel & { [k: string]: any };
+    ml._isAIInstance = true;
+    ml._aiInstanceSlug = inst.slug;
+    ml._aiInstanceID = inst.id;
+    ml._aiInstanceDefault = !!inst.isDefault;
+    ml._aiInstanceObject = inst;
+    ml._realProvider = realProvider;
+    ml._aiFeatureKind = inst.featureKind;
+    (ml as any).delete = async (): Promise<void> => { /* noop */ };
+    (ml as any).update = async (): Promise<MLModel> => ml;
+    return ml as MLModel;
+}
+
+export async function fetchAndWrapAIInstances(): Promise<{
+    instModels: MLModel[]; rawInsts: AIFunctionInstance[];
+}> {
+    let orgID: number | null = null;
+    try {
+        const user = await core.users.current();
+        orgID =
+            (user as any)?.organization?.id ??
+            (user as any)?.org?.id ??
+            (user as any)?.privacy?.organization_id ??
+            null;
+        if (typeof window !== 'undefined') {
+            const w = window as any;
+            const envOrgID = w.__CVAT_CURRENT_ORG_ID__ ?? w.ORGANIZATION_ID ?? w.__org_id__ ?? null;
+            if (!orgID && envOrgID) orgID = Number(envOrgID);
+        }
+        if (!orgID && (core as any).organizations?.list) {
+            const orgs = await (core as any).organizations.list();
+            if (Array.isArray(orgs) && orgs[0]?.id) orgID = Number(orgs[0].id);
+        }
+    } catch {
+        orgID = null;
+    }
+    if (!orgID) orgID = 1;
+
+    const tryUrls = [
+        `/api/organizations/${encodeURIComponent(String(orgID))}/ai-function-instances`,
+        `/api/organizations/${encodeURIComponent(String(orgID))}/ai-function-instances/`,
+    ];
+    let orgInsts: AIFunctionInstance[] = [];
+    for (let i = 0; i < tryUrls.length && !orgInsts.length; i++) {
+        try {
+            const resp = await fetch(tryUrls[i], {
+                method: 'GET', credentials: 'same-origin',
+                headers: { Accept: 'application/json, text/plain, */*' },
+            });
+            if (resp.ok) {
+                let raw: any[] = [];
+                try {
+                    const data = await resp.json();
+                    raw = Array.isArray(data) ? data :
+                        Array.isArray(data?.results) ? data.results :
+                        Array.isArray(data?.data) ? data.data : [];
+                } catch {
+                    raw = [];
+                }
+                if (raw.length) {
+                    orgInsts = raw
+                        .map((x) => new AIFunctionInstance(x))
+                        .filter((inst) => inst.isEnabled !== false && (inst as any).is_enabled !== false);
+                }
+            }
+        } catch {
+            orgInsts = orgInsts || [];
+        }
+    }
+
+    if (!orgInsts.length && (core as any).organizations?.get) {
+        try {
+            const orgs = await (core as any).organizations.get({ id: orgID });
+            const cur = Array.isArray(orgs) && orgs[0] ? orgs[0] : null;
+            if (cur && (cur as any).aiFunctionInstances?.list) {
+                orgInsts = await (cur as any).aiFunctionInstances.list({ isEnabled: true });
+            }
+        } catch {
+            orgInsts = orgInsts || [];
+        }
+    }
+
+    const instModels = orgInsts
+        .filter((inst) => (
+            inst.featureKind === AI_FEATURE_KIND.OBJECT_DETECTOR ||
+            inst.featureKind === AI_FEATURE_KIND.INTENTION_ESTIMATION ||
+            inst.featureKind === AI_FEATURE_KIND.IMAGE_CAPTION ||
+            inst.featureKind === AI_FEATURE_KIND.POSE_ESTIMATION
+        ))
+        .sort((a, b) => Number(!!b.isDefault) - Number(!!a.isDefault))
+        .map((inst) => wrapAIInstanceAsModel(inst));
+
+    return { instModels, rawInsts: orgInsts };
+}
+
+if (typeof window !== 'undefined') {
+    (window as any).__CVAT_AI_INSTANCE_INFERENCE__ = {
+        enabled: true,
+        featureKindDetector: AI_FEATURE_KIND.OBJECT_DETECTOR,
+        modelKindDetector: ModelKind.DETECTOR,
+        _AIFunctionInstanceRef: !!AIFunctionInstance,
+    };
+}
+
+interface StateToProps {
+    visible: boolean;
+    task: any;
+    jobId: number | null;
+    detectors: MLModel[];
+    reid: MLModel[];
+}
+
+interface DispatchToProps {
+    runInference(task: any, model: MLModel, body: object, meta?: object, jobId?: number | null): void;
+    closeDialog(): void;
+}
+
+function mapStateToProps(state: CombinedState): StateToProps {
+    const { models } = state;
+    const { detectors, reid } = models;
+
+    return {
+        visible: models.modelRunnerIsVisible,
+        task: models.modelRunnerTask,
+        jobId: models.modelRunnerJobId ?? null,
+        reid,
+        detectors,
+    };
+}
+
+function mapDispatchToProps(dispatch: ThunkDispatch): DispatchToProps {
+    return {
+        runInference(taskID: number, model: MLModel, body: object, meta?: object, jobId?: number | null): void {
+            dispatch(startInferenceAsync(taskID, model, body, meta, jobId ?? undefined));
+        },
+        closeDialog() {
+            dispatch(modelsActions.closeRunModelDialog());
+        },
+    };
+}
+
+function ModelRunnerDialog(props: StateToProps & DispatchToProps): JSX.Element {
+    const {
+        reid, detectors, task, visible, runInference, closeDialog, jobId,
+    } = props;
+
+    const [taskInstance, setTaskInstance] = useState<Task | null>(null);
+    const [mergedModels, setMergedModels] = useState<MLModel[]>([]);
+
+    useEffect(() => {
+        if (task) {
+            core.tasks.get({ id: task.id }).then(([_task]: Task[]) => {
+                if (_task) {
+                    setTaskInstance(_task);
+                }
+            }).catch((error: any) => {
+                notification.error({ message: 'Could not get task details', description: error.toString() });
+            });
+        }
+    }, [visible, task]);
+
+    useEffect(() => {
+        let cancelled = false;
+        (async (): Promise<void> => {
+            try {
+                const { instModels } = await fetchAndWrapAIInstances();
+                if (!cancelled) {
+                    // 去重：
+                    // detectors 是 Redux state.models.detectors，它已经通过 getModelsAsync 拼了 instModels，
+                    // 所以这里如果再直接拼 [...instModels, ...reid, ...detectors] → 每个 instance 出现两次（Bug 3 根因）
+                    // 解决方案：先把 detectors/reid 里已经是 AIInstance 的全部剔除，再和 instModels 合并；
+                    // 最后再按 model.id 去一次重，兼容各种边界情况。
+                    const dedupeFilter = (m: MLModel): boolean => !(m as any)?._isAIInstance;
+                    const cleanDetectors = detectors.filter(dedupeFilter);
+                    const cleanReid = reid.filter(dedupeFilter);
+                    const combined: MLModel[] = [...instModels, ...cleanReid, ...cleanDetectors];
+                    const seen = new Set<string>();
+                    const finalMerged: MLModel[] = [];
+                    for (const m of combined) {
+                        const mid = (m as any)?.id;
+                        const key = typeof mid === 'string' || typeof mid === 'number' ? String(mid) : `fallback_${String((m as any)?.name ?? '')}`;
+                        if (!key || seen.has(key)) continue;
+                        seen.add(key);
+                        finalMerged.push(m);
+                    }
+                    setMergedModels(finalMerged);
+                }
+            } catch (err: any) {
+                if (!cancelled) {
+                    const cleanDetectors = detectors.filter(m => !(m as any)?._isAIInstance);
+                    const cleanReid = reid.filter(m => !(m as any)?._isAIInstance);
+                    setMergedModels([...cleanReid, ...cleanDetectors]);
+                }
+            }
+        })();
+        return (): void => { cancelled = true; };
+    }, [visible, reid, detectors]);
+
+    return (
+        <Modal
+            destroyOnClose
+            open={visible}
+            footer={[]}
+            onCancel={(): void => closeDialog()}
+            maskClosable
+            title='Automatic annotation'
+        >
+            { taskInstance ? (
+                <DetectorRunner
+                    withCleanup
+                    models={mergedModels}
+                    labels={taskInstance.labels}
+                    dimension={taskInstance.dimension}
+                    runInference={(model: MLModel, body: object): void => {
+                        const anyModel = model as any;
+                        let meta: object | undefined;
+                        if (anyModel?._isAIInstance) {
+                            meta = {
+                                requested_instance_slug: anyModel._aiInstanceSlug,
+                                ai_instance_id: anyModel._aiInstanceID,
+                                ai_instance_default: !!anyModel._aiInstanceDefault,
+                            };
+                        }
+                        closeDialog();
+                        runInference(taskInstance.id, model, body, meta, jobId);
+                    }}
+                />
+            ) : <CVATLoadingSpinner /> }
+        </Modal>
+    );
+}
+
+export default connect(mapStateToProps, mapDispatchToProps)(ModelRunnerDialog);

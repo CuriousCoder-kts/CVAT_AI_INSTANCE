@@ -1,0 +1,57 @@
+# ========================================
+# docker-compose.override.yml Template
+# Copy this file to `docker-compose.override.yml` to customize your deployment.
+# This file is applied ON TOP OF the base docker-compose.yml.
+# ========================================
+
+version: '3.3'
+
+services:
+  cvat_server:
+    # Example: mount additional files into container
+    # volumes:
+    #   - ./custom_settings.py:/home/django/cvat/settings/custom.py:ro
+    #   - ./data:/home/django/data:rw
+
+    # Example: override Java heap / process tuning
+    # environment:
+    #   CVAT_POSTGRES_PASSWORD: ${CVAT_POSTGRES_PASSWORD:-cvat}
+
+    # Example: resource limits
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '2.0'
+    #       memory: 4G
+
+  cvat_ui:
+    # Example: expose UI directly on host port 8080 (without Traefik)
+    # ports:
+    #   - "8080:80"
+
+  traefik:
+    # Example: enable dashboard + custom TLS (production use docker-compose.https.yml instead)
+    # ports:
+    #   - "80:80"
+    #   - "443:443"
+    # volumes:
+    #   - ./certs:/etc/traefik/certs:ro
+
+  redis:
+    # Example: persist Redis data to host volume
+    # volumes:
+    #   - cvat_redis:/data
+
+  postgres:
+    # Example: persist Postgres data to host volume (default is already named volume)
+    # volumes:
+    #   - cvat_db:/var/lib/postgresql/data
+
+  clickhouse:
+    # volumes:
+    #   - cvat_clickhouse:/var/lib/clickhouse
+
+  vector:
+    # Example: disable vector if you don't need logs shipping
+    # deploy:
+    #   replicas: 0

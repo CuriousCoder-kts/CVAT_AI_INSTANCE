@@ -1,0 +1,111 @@
+// Copyright (C) 2022 Intel Corporation
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+import React, { useEffect, useRef } from 'react';
+
+import Text from 'antd/lib/typography/Text';
+import Button from 'antd/lib/button';
+import Upload, { RcFile } from 'antd/lib/upload';
+import { FolderOpenOutlined, InboxOutlined } from '@ant-design/icons';
+
+import { groupLocalFilesByTopFolder, prepareLocalUploadFiles } from 'utils/files';
+
+interface Props {
+    files: File[];
+    hint: string;
+    onUpload: (_: RcFile, uploadedFiles: RcFile[]) => boolean;
+}
+
+function toUploadList(files: File[]): RcFile[] {
+    return files as RcFile[];
+}
+
+export default function LocalFiles(props: Props): JSX.Element {
+    const { files, onUpload, hint } = props;
+    const folderInputRef = useRef<HTMLInputElement>(null);
+
+    useEffect(() => {
+        const input = folderInputRef.current;
+        if (!input) {
+            return;
+        }
+        input.setAttribute('webkitdirectory', '');
+        input.setAttribute('directory', '');
+        input.setAttribute('multiple', '');
+    }, []);
+
+    const emitUpload = (incoming: File[]): void => {
+        if (!incoming.length) {
+            return;
+        }
+        const prepared = prepareLocalUploadFiles(incoming);
+        const next = prepared.fromDirectory && prepared.files.length ? prepared.files : incoming;
+        const list = toUploadList(next);
+        onUpload(list[0], list);
+    };
+
+    const grouped = groupLocalFilesByTopFolder(files);
+    const folderCount = grouped.mode === 'folders' ? grouped.groups.length : 0;
+
+    return (
+        <>
+            <Upload.Dragger
+                multiple
+                listType='text'
+                fileList={files as any[]}
+                showUploadList={
+                    files.length < 5 && {
+                        showRemoveIcon: false,
+                    }
+                }
+                beforeUpload={(_: RcFile, uploadedFiles: RcFile[]): boolean => {
+                    emitUpload(uploadedFiles);
+                    return false;
+                }}
+            >
+                <p className='ant-upload-drag-icon'>
+                    <InboxOutlined />
+                </p>
+                <p className='ant-upload-text'>Click or drag files to this area</p>
+                <p className='ant-upload-hint'>{hint}</p>
+            </Upload.Dragger>
+            <div className='cvat-file-manager-folder-picker'>
+                <Button
+                    icon={<FolderOpenOutlined />}
+                    className='cvat-select-local-folder-button'
+                    onClick={(): void => folderInputRef.current?.click()}
+                >
+                    Select a folder
+                </Button>
+                <Text type='secondary' className='cvat-select-local-folder-hint'>
+                    Pick the parent folder. Each image subfolder becomes its own task.
+                </Text>
+                <input
+                    ref={folderInputRef}
+                    type='file'
+                    multiple
+                    className='cvat-select-local-folder-input'
+                    onChange={(event: React.ChangeEvent<HTMLInputElement>): void => {
+                        const list = event.target.files;
+                        if (list?.length) {
+                            emitUpload(Array.from(list));
+                        }
+                        event.target.value = '';
+                    }}
+                />
+            </div>
+            {files.length >= 5 && (
+                <>
+                    <br />
+                    <Text className='cvat-text-color'>
+                        {folderCount > 1 ?
+                            `${folderCount} folders, ${files.length} files selected` :
+                            `${files.length} files selected`}
+                    </Text>
+                </>
+            )}
+        </>
+    );
+}

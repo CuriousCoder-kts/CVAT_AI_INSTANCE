@@ -1,0 +1,378 @@
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useDispatch } from 'react-redux';
+import Button from 'antd/lib/button';
+import Modal from 'antd/lib/modal';
+import Text from 'antd/lib/typography/Text';
+import { ScissorOutlined } from '@ant-design/icons';
+
+import { truncateTrackAsync } from 'actions/annotation-actions';
+import { ObjectState, ObjectType } from 'cvat-core-wrapper';
+
+interface Props {
+    objectState: ObjectState | null;
+    frame: number;
+    startFrame: number;
+}
+
+interface BoxRect {
+    top: number;
+    left: number;
+    width: number;
+    height: number;
+}
+
+interface Callout {
+    box: BoxRect;
+    button: { top: number; left: number };
+    from: { x: number; y: number };
+    to: { x: number; y: number };
+    head: string;
+}
+
+function clamp(value: number, min: number, max: number): number {
+    return Math.max(min, Math.min(value, max));
+}
+
+function shapeBox(clientID: number): BoxRect | null {
+    const shape = window.document.getElementById(`cvat_canvas_shape_${clientID}`);
+    if (!shape) {
+        return null;
+    }
+    const box = shape.getBoundingClientRect();
+    if (box.width <= 0 && box.height <= 0) {
+        return null;
+    }
+    return {
+        top: box.top,
+        left: box.left,
+        width: Math.max(box.width, 8),
+        height: Math.max(box.height, 8),
+    };
+}
+
+function otherShapeBoxes(targetID: number): BoxRect[] {
+    const nodes = window.document.querySelectorAll<HTMLElement>('.cvat_canvas_shape');
+    const out: BoxRect[] = [];
+    nodes.forEach((node) => {
+        if (node.id === `cvat_canvas_shape_${targetID}`) {
+            return;
+        }
+        const box = node.getBoundingClientRect();
+        if (box.width <= 1 || box.height <= 1) {
+            return;
+        }
+        out.push({
+            top: box.top,
+            left: box.left,
+            width: box.width,
+            height: box.height,
+        });
+    });
+    return out;
+}
+
+function overlapArea(a: BoxRect, b: BoxRect): number {
+    const x = Math.max(0, Math.min(a.left + a.width, b.left + b.width) - Math.max(a.left, b.left));
+    const y = Math.max(0, Math.min(a.top + a.height, b.top + b.height) - Math.max(a.top, b.top));
+    return x * y;
+}
+
+function edgePoint(rect: BoxRect, towardX: number, towardY: number, inset: number): { x: number; y: number } {
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dx = towardX - cx;
+    const dy = towardY - cy;
+    if (dx === 0 && dy === 0) {
+        return { x: cx, y: cy };
+    }
+    const hw = Math.max(rect.width / 2 - inset, 1);
+    const hh = Math.max(rect.height / 2 - inset, 1);
+    const scale = Math.min(
+        Math.abs(dx) < 1e-6 ? Number.POSITIVE_INFINITY : hw / Math.abs(dx),
+        Math.abs(dy) < 1e-6 ? Number.POSITIVE_INFINITY : hh / Math.abs(dy),
+    );
+    return { x: cx + dx * scale, y: cy + dy * scale };
+}
+
+function aabbGap(a: BoxRect, b: BoxRect): number {
+    const ox = Math.min(a.left + a.width, b.left + b.width) - Math.max(a.left, b.left);
+    const oy = Math.min(a.top + a.height, b.top + b.height) - Math.max(a.top, b.top);
+    if (ox > 0 && oy > 0) {
+        return -Math.min(ox, oy);
+    }
+    const dx = ox > 0 ? 0 : Math.max(a.left - (b.left + b.width), b.left - (a.left + a.width));
+    const dy = oy > 0 ? 0 : Math.max(a.top - (b.top + b.height), b.top - (a.top + a.height));
+    return Math.hypot(dx, dy);
+}
+
+function arrowGeometry(button: BoxRect, box: BoxRect): {
+    from: { x: number; y: number };
+    to: { x: number; y: number };
+    head: string;
+} {
+    const boxCx = box.left + box.width / 2;
+    const boxCy = box.top + box.height / 2;
+    const from = edgePoint(button, boxCx, boxCy, 0);
+    const to = { x: boxCx, y: boxCy };
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const headLen = 16;
+    const stop = Math.max(0, (len - headLen) / len);
+    const tipBase = { x: from.x + dx * stop, y: from.y + dy * stop };
+    const nx = dx / len;
+    const ny = dy / len;
+    const left = {
+        x: tipBase.x - ny * 7,
+        y: tipBase.y + nx * 7,
+    };
+    const right = {
+        x: tipBase.x + ny * 7,
+        y: tipBase.y - nx * 7,
+    };
+    return {
+        from,
+        to: tipBase,
+        head: `${to.x},${to.y} ${left.x},${left.y} ${right.x},${right.y}`,
+    };
+}
+
+function layoutButton(
+    box: BoxRect,
+    buttonW: number,
+    buttonH: number,
+    targetID: number,
+): { top: number; left: number } {
+    const canvas = window.document.querySelector('.cvat-canvas-container')?.getBoundingClientRect();
+    if (!canvas) {
+        return { top: box.top, left: box.left };
+    }
+    const minGap = 56;
+    const pad = 10;
+    const minTop = canvas.top + pad;
+    const minLeft = canvas.left + pad;
+    const maxTop = Math.max(minTop, canvas.bottom - buttonH - pad);
+    const maxLeft = Math.max(minLeft, canvas.right - buttonW - pad);
+    const cx = box.left + box.width / 2;
+    const cy = box.top + box.height / 2;
+    const others = otherShapeBoxes(targetID);
+
+    const raw: Array<{ top: number; left: number }> = [
+        { top: box.top - buttonH - minGap, left: cx - buttonW / 2 },
+        { top: box.top + box.height + minGap, left: cx - buttonW / 2 },
+        { top: cy - buttonH / 2, left: box.left + box.width + minGap },
+        { top: cy - buttonH / 2, left: box.left - buttonW - minGap },
+        { top: box.top - buttonH - minGap, left: box.left + box.width + 12 },
+        { top: box.top - buttonH - minGap, left: box.left - buttonW - 12 },
+        { top: box.top + box.height + minGap, left: box.left + box.width + 12 },
+        { top: box.top + box.height + minGap, left: box.left - buttonW - 12 },
+        { top: minTop, left: minLeft },
+        { top: minTop, left: maxLeft },
+        { top: maxTop, left: minLeft },
+        { top: maxTop, left: maxLeft },
+        { top: minTop, left: cx - buttonW / 2 },
+        { top: maxTop, left: cx - buttonW / 2 },
+        { top: cy - buttonH / 2, left: minLeft },
+        { top: cy - buttonH / 2, left: maxLeft },
+    ];
+
+    let best = { top: minTop, left: minLeft };
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (const candidate of raw) {
+        const top = clamp(candidate.top, minTop, maxTop);
+        const left = clamp(candidate.left, minLeft, maxLeft);
+        const buttonRect: BoxRect = {
+            top, left, width: buttonW, height: buttonH,
+        };
+        const coverOthers = others.reduce((sum, other) => sum + overlapArea(buttonRect, other), 0);
+        const coverTarget = overlapArea(buttonRect, box);
+        const gapToTarget = aabbGap(buttonRect, box);
+        const dist = Math.hypot(left + buttonW / 2 - cx, top + buttonH / 2 - cy);
+        let score = coverOthers * 120 + dist;
+        if (coverTarget > 0) {
+            score += 100000 + coverTarget * 50;
+        }
+        if (gapToTarget < minGap) {
+            score += (minGap - Math.max(gapToTarget, 0)) * 400;
+        }
+        if (score < bestScore) {
+            bestScore = score;
+            best = { top, left };
+        }
+    }
+    return best;
+}
+
+function estimateButtonSize(label: string): { width: number; height: number } {
+    return {
+        width: Math.ceil(52 + label.length * 7.2),
+        height: 32,
+    };
+}
+
+function objectCaption(objectState: ObjectState): string {
+    const name = String((objectState as any)?.label?.name || 'object').trim() || 'object';
+    return `${name} #${objectState.clientID}`;
+}
+
+export default function TrackCropDropdown(props: Props): JSX.Element | null {
+    const { objectState, frame, startFrame } = props;
+    const dispatch = useDispatch();
+    const wrapRef = useRef<HTMLDivElement>(null);
+    const [measured, setMeasured] = useState<{ width: number; height: number } | null>(null);
+    const [callout, setCallout] = useState<Callout | null>(null);
+
+    const isTrack = objectState?.objectType === ObjectType.TRACK &&
+        Number.isInteger(objectState.clientID) &&
+        !objectState.lock &&
+        !objectState.isGroundTruth;
+    const caption = objectState ? objectCaption(objectState) : '';
+    const buttonLabel = `Delete ${caption} · frame ${frame}`;
+
+    const updateCallout = useCallback((): void => {
+        if (!isTrack || objectState?.clientID == null) {
+            setCallout(null);
+            return;
+        }
+        const box = shapeBox(objectState.clientID);
+        if (!box) {
+            setCallout(null);
+            return;
+        }
+        const size = measured || estimateButtonSize(buttonLabel);
+        const buttonPos = layoutButton(box, size.width, size.height, objectState.clientID);
+        const buttonRect: BoxRect = {
+            top: buttonPos.top,
+            left: buttonPos.left,
+            width: size.width,
+            height: size.height,
+        };
+        const { from, to, head } = arrowGeometry(buttonRect, box);
+        setCallout({ box, button: buttonPos, from, to, head });
+    }, [isTrack, objectState?.clientID, measured, buttonLabel]);
+
+    useEffect(() => {
+        updateCallout();
+        const onScroll = (): void => updateCallout();
+        window.addEventListener('resize', onScroll);
+        const canvas = window.document.querySelector('.cvat-canvas-container');
+        canvas?.addEventListener('scroll', onScroll, true);
+        canvas?.addEventListener('wheel', onScroll, true);
+        const timer = window.setInterval(updateCallout, 250);
+        return () => {
+            window.removeEventListener('resize', onScroll);
+            canvas?.removeEventListener('scroll', onScroll, true);
+            canvas?.removeEventListener('wheel', onScroll, true);
+            window.clearInterval(timer);
+        };
+    }, [updateCallout, frame]);
+
+    useLayoutEffect(() => {
+        const node = wrapRef.current;
+        if (!node) {
+            return;
+        }
+        const width = Math.ceil(node.getBoundingClientRect().width);
+        const height = Math.ceil(node.getBoundingClientRect().height);
+        if (!measured || Math.abs(measured.width - width) > 1 || Math.abs(measured.height - height) > 1) {
+            setMeasured({ width, height });
+        }
+    }, [buttonLabel, callout?.button.top, callout?.button.left, measured]);
+
+    const firstKeyframe = objectState?.keyframes?.first ?? startFrame;
+
+    const confirmTruncate = useCallback((): void => {
+        if (!objectState) return;
+        const removesAll = frame <= firstKeyframe;
+        Modal.confirm({
+            title: removesAll ? `Remove entire track ${caption}` : `Delete ${caption} from frame ${frame}`,
+            content: removesAll ? (
+                <Text>
+                    Frame {frame} is at or before the first keyframe, so the whole track {caption} will be removed.
+                </Text>
+            ) : (
+                <Text>
+                    Keep {caption} on frames before {frame}. Remove it from frame {frame} to the end of the job.
+                    Grouped shapes (for example VanCar + keypoints + Rear) are truncated together.
+                </Text>
+            ),
+            okText: removesAll ? 'Remove track' : 'Delete from this frame',
+            okType: 'danger',
+            cancelText: 'Cancel',
+            className: 'cvat-modal-confirm-truncate-track',
+            onOk: () => dispatch(truncateTrackAsync(objectState, frame)),
+        });
+    }, [dispatch, firstKeyframe, objectState, frame, caption]);
+
+    if (!isTrack || !callout) {
+        return null;
+    }
+
+    const { button, from, to, head } = callout;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    return (
+        <>
+            <svg
+                className='cvat-track-crop-connector'
+                aria-hidden
+                width={vw}
+                height={vh}
+                viewBox={`0 0 ${vw} ${vh}`}
+            >
+                <line
+                    x1={from.x}
+                    y1={from.y}
+                    x2={to.x}
+                    y2={to.y}
+                    stroke='#fff'
+                    strokeWidth='6'
+                    strokeLinecap='round'
+                />
+                <line
+                    x1={from.x}
+                    y1={from.y}
+                    x2={to.x}
+                    y2={to.y}
+                    stroke='#ff4d4f'
+                    strokeWidth='3'
+                    strokeLinecap='round'
+                />
+                <polygon
+                    id='cvat-track-crop-arrowhead'
+                    points={head}
+                    fill='#ff4d4f'
+                    stroke='#fff'
+                    strokeWidth='1.5'
+                    strokeLinejoin='round'
+                />
+            </svg>
+            <div
+                ref={wrapRef}
+                className='cvat-track-crop-dropdown'
+                data-cvat-track-crop='click-pin'
+                style={{ top: button.top, left: button.left }}
+            >
+                <Button
+                    danger
+                    type='primary'
+                    className='cvat-track-crop-dropdown-button'
+                    icon={<ScissorOutlined />}
+                    title={`Delete ${caption} from frame ${frame}`}
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onClick={(event) => {
+                        event.stopPropagation();
+                        confirmTruncate();
+                    }}
+                >
+                    {buttonLabel}
+                </Button>
+            </div>
+        </>
+    );
+}

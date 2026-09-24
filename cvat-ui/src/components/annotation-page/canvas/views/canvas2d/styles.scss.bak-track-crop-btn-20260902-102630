@@ -1,0 +1,131 @@
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+@import 'base';
+
+.cvat-image-setups-filters {
+    margin-bottom: $grid-unit-size * 3;
+}
+
+.cvat-canvas-hints-container {
+    filter: none;
+    position: absolute;
+    top: $grid-unit-size;
+    right: $grid-unit-size;
+    width: $grid-unit-size * 32;
+    background: rgba(0, 0, 0, 60%);
+    color: white;
+    padding: $grid-unit-size;
+    border-radius: $border-radius-base;
+    transition: filter 0.15s linear;
+    overflow: hidden;
+    z-index: 100;
+    pointer-events: none;
+
+    &.cvat-canvas-hints-container-disabled {
+        filter: blur(10px);
+        visibility: hidden;
+    }
+
+    .cvat-canvas-hints-block {
+        font-weight: normal;
+        font-size: smaller;
+
+        > ul {
+            padding-inline-start: $grid-unit-size * 2;
+            margin-bottom: 0;
+        }
+
+        &:not(:first-child) {
+            margin-top: $grid-unit-size * 2;
+            font-weight: lighter;
+        }
+
+        > span[role="img"] {
+            margin-right: $grid-unit-size;
+        }
+
+        > .ant-typography {
+            color: white;
+        }
+    }
+
+    .cvat-canvas-hints-hide-button {
+        float: right;
+        pointer-events: all;
+        margin-top: $grid-unit-size * 2;
+
+        &:hover {
+            transform: scale(1.1);
+        }
+    }
+}
+
+.cvat-track-crop-highlight {
+    position: fixed;
+    z-index: 998;
+    pointer-events: none;
+    box-sizing: border-box;
+    border: 4px solid #ff4d4f;
+    background: rgba(255, 77, 79, 28%);
+    box-shadow: 0 0 0 3px #fff, 0 0 0 8px rgba(255, 77, 79, 45%);
+    border-radius: 2px;
+    animation: cvat-track-crop-pulse 1.2s ease-in-out infinite;
+}
+
+.cvat-track-crop-highlight-tag {
+    position: absolute;
+    top: -22px;
+    left: -4px;
+    padding: 1px 8px;
+    background: #ff4d4f;
+    color: #fff;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 18px;
+    border-radius: 3px 3px 0 0;
+    white-space: nowrap;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 35%);
+}
+
+@keyframes cvat-track-crop-pulse {
+    0%,
+    100% {
+        box-shadow: 0 0 0 3px #fff, 0 0 0 8px rgba(255, 77, 79, 45%);
+    }
+
+    50% {
+        box-shadow: 0 0 0 3px #fff, 0 0 0 12px rgba(255, 77, 79, 18%);
+    }
+}
+
+.cvat-track-crop-connector {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    z-index: 999;
+    pointer-events: none;
+    overflow: visible;
+}
+
+.cvat-track-crop-dropdown {
+    position: fixed;
+    z-index: 1000;
+    pointer-events: auto;
+}
+
+.cvat-track-crop-dropdown-button {
+    height: 40px;
+    width: 100%;
+    padding: 0 14px;
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 38px;
+    border-radius: 6px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 45%);
+}

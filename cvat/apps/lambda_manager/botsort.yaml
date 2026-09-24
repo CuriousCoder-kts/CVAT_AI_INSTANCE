@@ -1,0 +1,21 @@
+# Ultralytics BoT-SORT defaults (from colleague MOT project).
+# Docs: https://docs.ultralytics.com/modes/track
+# GMC here is Ultralytics sparseOptFlow, not CVAT Optical Flow DIS.
+
+tracker_type: botsort
+track_high_thresh: 0.15
+track_low_thresh: 0.05
+new_track_thresh: 0.15
+track_buffer: 30
+# 0.8 + low-conf dets caused ID switches on parked cars (new id + lost ghost).
+match_thresh: 0.7
+# fuse_score=True with match_thresh=0.8 rejects any det whose conf < 0.2 even at IoU=1
+# (cost = 1 - iou*conf). This camera's cars are ~0.16–0.23, so keep fuse_score off.
+fuse_score: False
+
+gmc_method: sparseOptFlow
+
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto

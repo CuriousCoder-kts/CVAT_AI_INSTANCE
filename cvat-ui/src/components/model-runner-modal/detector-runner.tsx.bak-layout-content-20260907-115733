@@ -1,0 +1,396 @@
+// Copyright (C) 2020-2022 Intel Corporation
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+import './styles.scss';
+import React, { useEffect, useState } from 'react';
+import { Row, Col } from 'antd/lib/grid';
+import Select from 'antd/lib/select';
+import Text from 'antd/lib/typography/Text';
+import InputNumber from 'antd/lib/input-number';
+import Button from 'antd/lib/button';
+import Switch from 'antd/lib/switch';
+import notification from 'antd/lib/notification';
+import { QuestionCircleOutlined } from '@ant-design/icons';
+
+import CVATTooltip from 'components/common/cvat-tooltip';
+import { clamp } from 'utils/math';
+import {
+    MLModel, ModelKind, DimensionType, Label, LabelType,
+} from 'cvat-core-wrapper';
+import { type Canvas } from 'cvat-canvas-wrapper';
+
+import LabelsMapperComponent, { LabelInterface, FullMapping } from './labels-mapper';
+import RegionOfInterestInputComponent from './region-of-interest-input';
+import { isPlaceholderLabel } from 'components/ai-feature-page/presets';
+
+export type RegionOfInterest = NonNullable<AnnotateTaskRequestBody['roi']> | null;
+
+interface Props {
+    withCleanup: boolean;
+    models: MLModel[];
+    labels: Label[];
+    dimension: DimensionType;
+    frameWidth?: number;
+    frameHeight?: number;
+    canvasInstance?: Canvas;
+    onRegionOfInterestChange?: (regionOfInterest: RegionOfInterest) => void;
+    runInference(model: MLModel, body: object): void;
+}
+
+type ServerMapping = Record<string, {
+    name: string;
+    attributes: Record<string, string>;
+    sublabels?: ServerMapping;
+}>;
+
+export interface AnnotateTaskRequestBody {
+    type: 'annotate_task';
+    mapping: ServerMapping;
+    cleanup: boolean;
+    conv_mask_to_poly: boolean;
+    threshold?: number;
+    roi?: [number, number, number, number];
+}
+
+function convertMappingToServer(mapping: FullMapping): ServerMapping {
+    return mapping.reduce<ServerMapping>((acc, [modelLabel, taskLabel, attributesMapping, subMapping]) => {
+        if (!modelLabel || !modelLabel.name || isPlaceholderLabel(modelLabel.name)) return acc;
+        const mappedName = (taskLabel && taskLabel.name) ? String(taskLabel.name) : String(modelLabel.name);
+        if (isPlaceholderLabel(mappedName)) return acc;
+        return {
+            ...acc,
+            [modelLabel.name]: {
+                name: mappedName,
+                attributes: Array.isArray(attributesMapping) ? attributesMapping.reduce<Record<string, string>>((attrAcc, val) => {
+                    if (val && val[0]?.name && val[1]?.name) {
+                        // eslint-disable-next-line no-param-reassign
+                        attrAcc[val[0].name] = val[1].name;
+                    }
+                    return attrAcc;
+                }, {}) : {},
+                ...(Array.isArray(subMapping) && subMapping.length ? { sublabels: convertMappingToServer(subMapping) } : {}),
+            },
+        };
+    }, {});
+}
+
+const HTTP_PRESET_LEFTOVER_LABELS = new Set([
+    'object', 'box', 'image', 'text', 'title', 'table', 'figure', 'caption',
+]);
+
+function isHttpMicroserviceModel(model: unknown): boolean {
+    const anyModel = model as any;
+    if (!anyModel?._isAIInstance) return false;
+    const cfg = anyModel?._aiInstanceObject?.config || {};
+    const backend = String(cfg.local_backend || cfg.vision_backend || '').trim().toLowerCase();
+    const mdl = String(cfg.model || '').trim().toLowerCase();
+    if (['http', 'http_microservice', 'http_detector', 'http_post', 'generic_http'].includes(backend)) {
+        return true;
+    }
+    if (mdl === 'http_detector' || mdl.startsWith('http_')) return true;
+    if (String(cfg.execution_mode || '').toLowerCase() === 'vision_pipeline' &&
+        String(cfg.api_url || '').trim() &&
+        !mdl.includes('clrernet')) {
+        return true;
+    }
+    return false;
+}
+
+function nameNorm(s: string): string {
+    return String(s || '').toLowerCase().replace(/[\s_-]+/g, '').trim();
+}
+
+function filterHttpModelLabels(
+    modelLabels: LabelInterface[],
+    taskLabels: LabelInterface[],
+): LabelInterface[] {
+    const taskNorms = new Set(taskLabels.map((t) => nameNorm(t.name)).filter(Boolean));
+    const matched = modelLabels.filter((ml) => {
+        const n = nameNorm(ml.name);
+        return !!(n && taskNorms.has(n) && !isPlaceholderLabel(ml.name));
+    });
+    if (!matched.length) {
+        return modelLabels.filter((ml) => !isPlaceholderLabel(ml.name));
+    }
+    const extras = modelLabels.filter((ml) => {
+        if (matched.includes(ml)) return false;
+        if (isPlaceholderLabel(ml.name)) return false;
+        if (HTTP_PRESET_LEFTOVER_LABELS.has(String(ml.name || '').toLowerCase())) return false;
+        return true;
+    });
+    return [...matched, ...extras];
+}
+
+function DetectorRunner(props: Props): JSX.Element {
+    const {
+        models, withCleanup, labels, dimension, runInference,
+        frameWidth, frameHeight, canvasInstance, onRegionOfInterestChange,
+    } = props;
+
+    const [modelID, setModelID] = useState<string | null>(null);
+    const [threshold, setThreshold] = useState<number>(0.5);
+    const [distance, setDistance] = useState<number>(50);
+    const [cleanup, setCleanup] = useState<boolean>(false);
+    const [mapping, setMapping] = useState<FullMapping>([]);
+    const [convertMasksToPolygons, setConvertMasksToPolygons] = useState<boolean>(false);
+    const [detectorThreshold, setDetectorThreshold] = useState<number | null>(null);
+    const [modelLabels, setModelLabels] = useState<LabelInterface[]>([]);
+    const [taskLabels, setTaskLabels] = useState<LabelInterface[]>([]);
+    const [regionOfInterest, setRegionOfInterest] = useState<RegionOfInterest>(null);
+
+    const model = models.find((_model): boolean => _model.id === modelID);
+    const isDetector = model?.kind === ModelKind.DETECTOR;
+    const isReId = model?.kind === ModelKind.REID;
+    const modelAny: any = model as any;
+    const isAICaptionInstance = !!modelAny?._isAIInstance &&
+        String(modelAny?._aiFeatureKind || modelAny?._aiInstanceObject?.featureKind || '').toLowerCase() === 'image_caption';
+    const showMapping = isDetector && !isAICaptionInstance;
+    const showROI = isDetector && dimension === DimensionType.DIMENSION_2D;
+    const convertMasks2PolygonVisible = isDetector &&
+        [LabelType.ANY, LabelType.MASK].includes(model.returnType);
+
+    // R8 Prompt 自由模式 + R7/R8 后端自动补 DB labels：
+    // 之前逻辑 mappingFullyPaired 要求「每行左右都有值」——有任意 label 在 Task/Project 侧暂时没有对应（如新增的 traffic_light、
+    // 或 FREE LABEL 在 Setup mapping 里没选）就会 Annotate 灰掉，后端 R7/R8 的自动 create Label 兜底根本无法发挥。
+    // 新逻辑：只要至少有一个 AI label（modelLabel = row[0]）非空就允许提交，空 row[1] 的条目 convertMappingToServer 会写 name=''，
+    // 后端 make_default_mapping 会按同名从 DB 查，查不到就当场 Label.objects.create（R7/R8 T3 loose fallback），100% 不会静默丢。
+    const mappingFullyPaired = Array.isArray(mapping) && mapping.length > 0 &&
+        !mapping.some((row) => !row || !row[0] || !row[1]);
+    const mappingHasAnyAILabel = Array.isArray(mapping) && mapping.some((row) => row && row[0] && typeof row[0].name === 'string' && row[0].name.trim());
+    const buttonEnabled = model && (
+        isReId ||
+        (isDetector && (isAICaptionInstance || mappingFullyPaired || mappingHasAnyAILabel))
+    );
+    const httpMicroservice = isHttpMicroserviceModel(model);
+
+    useEffect(() => {
+        const converted = labels.map((label) => ({
+            name: label.name,
+            type: label.type,
+            color: label.color,
+            attributes: label.attributes.map((attr) => ({
+                name: attr.name,
+                input_type: attr.inputType,
+                values: [...attr.values],
+            })),
+            sublabels: (label.structure?.sublabels || []).map((sublabel) => ({
+                name: sublabel.name,
+                type: sublabel.type,
+                color: sublabel.color,
+                attributes: sublabel.attributes.map((attr) => ({
+                    name: attr.name,
+                    input_type: attr.inputType,
+                    values: [...attr.values],
+                })),
+            })),
+        }));
+
+        setTaskLabels(converted);
+        if (model) {
+            const raw = Array.isArray(model.labels) ? model.labels : [];
+            const nextLabels = isHttpMicroserviceModel(model)
+                ? filterHttpModelLabels(raw, converted)
+                : raw;
+            setModelLabels(nextLabels);
+            if (!raw.length && model.kind !== ModelKind.REID) {
+                notification.warning({
+                    message: 'This model does not have specified labels',
+                    description: isHttpMicroserviceModel(model)
+                        ? 'Edit the AI instance Labels tab, or click Test connection if the API implements GET /labels.'
+                        : undefined,
+                    duration: 8,
+                });
+            }
+        } else {
+            setModelLabels([]);
+        }
+    }, [labels, model]);
+
+    useEffect(() => {
+        if (!showROI) {
+            setRegionOfInterest(null);
+        }
+    }, [showROI]);
+
+    useEffect(() => {
+        if (onRegionOfInterestChange) {
+            onRegionOfInterestChange(regionOfInterest);
+        }
+    }, [regionOfInterest]);
+
+    return (
+        <div className='cvat-run-model-content'>
+            <Row align='middle'>
+                <Col span={4}>Model:</Col>
+                <Col span={20}>
+                    <Select
+                        placeholder={dimension === DimensionType.DIMENSION_2D ? 'Select a model' : 'No models available'}
+                        disabled={dimension !== DimensionType.DIMENSION_2D}
+                        style={{ width: '100%' }}
+                        onChange={(_modelID: string): void => {
+                            setModelID(_modelID);
+                        }}
+                    >
+                        {models.map(
+                            (_model: MLModel): JSX.Element => (
+                                <Select.Option value={_model.id} key={_model.id}>
+                                    {_model.name}
+                                </Select.Option>
+                            ),
+                        )}
+                    </Select>
+                </Col>
+            </Row>
+            {showMapping && (
+                <div>
+                    <div className='cvat-detector-runner-mapping-header'>
+                        <Text>Setup mapping between labels and attributes</Text>
+                        <CVATTooltip title='Same-name labels are pre-selected. Unmapped leftover classes (box/image/…) are skipped. Map at least one pair before Annotate.'>
+                            <QuestionCircleOutlined className='cvat-info-circle-icon' />
+                        </CVATTooltip>
+                    </div>
+                    <LabelsMapperComponent
+                        key={modelID} // rerender when model switched
+                        onUpdateMapping={(_mapping: FullMapping) => setMapping(_mapping)}
+                        modelLabels={modelLabels}
+                        taskLabels={taskLabels}
+                    />
+                    {httpMicroservice ? (
+                        <Text type='secondary' style={{ fontSize: 12, display: 'block', marginTop: 6 }}>
+                            Same-name labels are pre-selected. Leftover HTTP preset names (box/image/…) are hidden when this task already has a matching name (e.g. lane). Unmapped leftovers are not sent.
+                        </Text>
+                    ) : null}
+                </div>
+            )}
+            {isDetector && (
+                <div className='cvat-detector-runner-threshold-wrapper'>
+                    <div>
+                        <Text>Threshold</Text>
+                        <CVATTooltip title='Minimum confidence threshold for detections. Leave empty to use the default value specified in the model settings'>
+                            <QuestionCircleOutlined className='cvat-info-circle-icon' />
+                        </CVATTooltip>
+                    </div>
+                    <Row align='middle' justify='start'>
+                        <Col>
+                            <InputNumber
+                                min={0.01}
+                                step={0.01}
+                                max={1}
+                                value={detectorThreshold}
+                                onChange={(value: number | null) => {
+                                    setDetectorThreshold(value);
+                                }}
+                            />
+                        </Col>
+                    </Row>
+                </div>
+            )}
+            {showROI && (
+                <RegionOfInterestInputComponent
+                    frameWidth={frameWidth}
+                    frameHeight={frameHeight}
+                    canvasInstance={canvasInstance}
+                    onSubmit={setRegionOfInterest}
+                />
+            )}
+            {convertMasks2PolygonVisible && (
+                <div className='cvat-detector-runner-convert-masks-to-polygons-wrapper'>
+                    <Switch
+                        checked={convertMasksToPolygons}
+                        onChange={(checked: boolean) => {
+                            setConvertMasksToPolygons(checked);
+                        }}
+                    />
+                    <Text>Convert masks to polygons</Text>
+                </div>
+            )}
+            {isDetector && withCleanup && (
+                <div className='cvat-detector-runner-clean-previous-annotations-wrapper'>
+                    <Switch
+                        checked={cleanup}
+                        onChange={(checked: boolean): void => setCleanup(checked)}
+                    />
+                    <Text>Clean previous annotations</Text>
+                </div>
+            )}
+            {isReId ? (
+                <div>
+                    <Row align='middle' justify='start'>
+                        <Col>
+                            <Text>Threshold</Text>
+                        </Col>
+                        <Col offset={1}>
+                            <CVATTooltip title='Minimum similarity value for shapes that can be merged'>
+                                <InputNumber
+                                    min={0.01}
+                                    step={0.01}
+                                    max={1}
+                                    value={threshold}
+                                    onChange={(value: number | undefined | string | null) => {
+                                        if (typeof value !== 'undefined' && value !== null) {
+                                            setThreshold(clamp(+value, 0.01, 1));
+                                        }
+                                    }}
+                                />
+                            </CVATTooltip>
+                        </Col>
+                    </Row>
+                    <Row align='middle' justify='start'>
+                        <Col>
+                            <Text>Maximum distance</Text>
+                        </Col>
+                        <Col offset={1}>
+                            <CVATTooltip title='Maximum distance between shapes that can be merged'>
+                                <InputNumber
+                                    placeholder='Threshold'
+                                    min={1}
+                                    value={distance}
+                                    onChange={(value: number | undefined | string | null) => {
+                                        if (typeof value !== 'undefined' && value !== null) {
+                                            setDistance(+value);
+                                        }
+                                    }}
+                                />
+                            </CVATTooltip>
+                        </Col>
+                    </Row>
+                </div>
+            ) : null}
+            <Row align='middle' justify='end'>
+                <Col>
+                    <Button
+                        className='cvat-inference-run-button'
+                        disabled={!buttonEnabled}
+                        type='primary'
+                        onClick={() => {
+                            if (!model) return;
+                            const paired = mapping.filter((row) => row && row[0]?.name && row[1]?.name);
+                            const toSend = (httpMicroservice && paired.length) ? paired : mapping;
+                            const serverMapping = convertMappingToServer(toSend);
+                            if (model.kind === ModelKind.DETECTOR) {
+                                const body: AnnotateTaskRequestBody = {
+                                    type: 'annotate_task',
+                                    mapping: serverMapping,
+                                    cleanup,
+                                    conv_mask_to_poly: convertMasksToPolygons,
+                                    ...(detectorThreshold !== null ? { threshold: detectorThreshold } : {}),
+                                    ...(regionOfInterest ? { roi: regionOfInterest } : {}),
+                                };
+
+                                runInference(model, body);
+                            } else if (model.kind === ModelKind.REID) {
+                                runInference(model, { threshold, max_distance: distance });
+                            }
+                        }}
+                    >
+                        Annotate
+                    </Button>
+                </Col>
+            </Row>
+        </div>
+    );
+}
+
+export default React.memo(DetectorRunner);

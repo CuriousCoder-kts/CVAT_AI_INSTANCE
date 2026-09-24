@@ -1,0 +1,95 @@
+"""Assemble per-frame detector boxes with a stable object id into CVAT tracks.
+
+Colleague ``POST /predict`` may return ``track_id`` / ``object_id`` for the same
+object on every frame. Automatic annotation used to write independent shapes;
+this module groups them into tracks when those keys are present.
+
+Generic per-frame ``id`` is intentionally ignored.
+
+Marker: ``stable-id-tracks``.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from copy import deepcopy
+from typing import Any
+
+TRACK_KEY_FIELD = "_track_key"
+_AUTO_SOURCE = "auto"
+
+
+def stitch_shapes_into_tracks(
+    shapes: list[dict[str, Any]],
+    *,
+    last_frame: int | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    grouped: dict[tuple[Any, Any, str], list[dict[str, Any]]] = defaultdict(list)
+    leftovers: list[dict[str, Any]] = []
+    for raw in shapes:
+        if not isinstance(raw, dict):
+            continue
+        shape = dict(raw)
+        key = shape.pop(TRACK_KEY_FIELD, None)
+        if key is None or str(key).strip() == "":
+            leftovers.append(shape)
+            continue
+        grouped[(shape.get("label_id"), shape.get("type"), str(key).strip())].append(shape)
+
+    tracks: list[dict[str, Any]] = []
+    for _gkey, path in grouped.items():
+        path.sort(key=lambda item: int(item.get("frame") or 0))
+        by_frame: dict[int, dict[str, Any]] = {}
+        for box in path:
+            by_frame[int(box.get("frame") or 0)] = box
+        path = [by_frame[frame] for frame in sorted(by_frame)]
+        if not path:
+            continue
+
+        box0 = path[0]
+        keyframes: list[dict[str, Any]] = []
+        for box in path:
+            item = deepcopy(box)
+            item.pop("id", None)
+            item.pop("group", None)
+            item.pop("label_id", None)
+            item.pop("source", None)
+            item.pop(TRACK_KEY_FIELD, None)
+            item["outside"] = False
+            item.setdefault("occluded", False)
+            item.setdefault("z_order", 0)
+            item.setdefault("attributes", [])
+            keyframes.append(item)
+
+        filled: list[dict[str, Any]] = []
+        for shp in keyframes:
+            if filled:
+                prev = filled[-1]
+                prev_f = int(prev["frame"])
+                cur_f = int(shp["frame"])
+                if cur_f > prev_f + 1:
+                    gap = deepcopy(prev)
+                    gap["outside"] = True
+                    gap["frame"] = prev_f + 1
+                    gap.pop("id", None)
+                    filled.append(gap)
+            filled.append(shp)
+
+        if last_frame is not None and filled and int(filled[-1]["frame"]) < int(last_frame):
+            end = deepcopy(filled[-1])
+            end["outside"] = True
+            end["frame"] = int(filled[-1]["frame"]) + 1
+            end.pop("id", None)
+            filled.append(end)
+
+        tracks.append(
+            {
+                "label_id": box0["label_id"],
+                "group": None,
+                "attributes": [],
+                "frame": box0["frame"],
+                "shapes": filled,
+                "source": _AUTO_SOURCE,
+            }
+        )
+    return tracks, leftovers

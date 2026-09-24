@@ -1,0 +1,156 @@
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+@import 'base';
+
+.cvat-statistics-page {
+    height: calc(100vh - #{$header-height});
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    padding: $grid-unit-size * 1.5 $grid-unit-size * 2 $grid-unit-size * 2;
+    overflow: hidden;
+    background: $background-color-2;
+
+    .cvat-statistics-header {
+        flex-shrink: 0;
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: center;
+        gap: $grid-unit-size;
+        margin-bottom: $grid-unit-size * 1.5;
+    }
+
+    .cvat-statistics-title {
+        display: flex;
+        align-items: center;
+        gap: $grid-unit-size;
+        margin: 0;
+        font-size: 16px;
+        font-weight: 600;
+        line-height: 1.3;
+    }
+
+    .cvat-statistics-filters {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: $grid-unit-size;
+    }
+
+    .cvat-statistics-date-picker {
+        width: $grid-unit-size * 30;
+    }
+
+    .cvat-statistics-project-filter,
+    .cvat-statistics-task-filter {
+        min-width: $grid-unit-size * 24;
+        max-width: $grid-unit-size * 36;
+    }
+
+    .cvat-statistics-group-by {
+        flex-shrink: 0;
+    }
+
+    .cvat-statistics-kpis {
+        flex-shrink: 0;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: $grid-unit-size * 1.5;
+        margin-bottom: $grid-unit-size * 1.5;
+
+        .ant-card-body {
+            padding: $grid-unit-size $grid-unit-size * 2;
+        }
+
+        .ant-statistic-title {
+            margin-bottom: 0;
+            font-size: 12px;
+        }
+
+        .ant-statistic-content {
+            font-size: 22px;
+            font-weight: 600;
+        }
+    }
+
+    .cvat-statistics-grid {
+        flex: 1;
+        min-height: 0;
+        display: grid;
+        grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.9fr);
+        grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+        gap: $grid-unit-size * 1.5;
+    }
+
+    .cvat-statistics-panel {
+        min-width: 0;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        background: $background-color-1;
+        border: 1px solid $border-color-1;
+        border-radius: $border-radius-base;
+        padding: $grid-unit-size $grid-unit-size * 1.5 $grid-unit-size * 1.5;
+    }
+
+    .cvat-statistics-panel-title {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: $grid-unit-size;
+        margin-bottom: $grid-unit-size;
+        font-size: 13px;
+        font-weight: 600;
+        color: $text-color;
+    }
+
+    .cvat-statistics-chart-wrap {
+        flex: 1;
+        min-height: 0;
+        position: relative;
+
+        canvas {
+            max-height: 100%;
+        }
+    }
+
+    .cvat-statistics-table-wrap {
+        flex: 1;
+        min-height: 0;
+        overflow: auto;
+    }
+
+    .cvat-statistics-empty,
+    .cvat-statistics-spinner {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .cvat-statistics-alert {
+        flex-shrink: 0;
+        margin-bottom: $grid-unit-size;
+    }
+}
+
+@media screen and (max-width: 1280px) {
+    .cvat-statistics-page {
+        overflow: auto;
+
+        .cvat-statistics-grid {
+            grid-template-columns: 1fr;
+            grid-template-rows: none;
+            height: auto;
+        }
+
+        .cvat-statistics-panel {
+            min-height: $grid-unit-size * 28;
+        }
+    }
+}

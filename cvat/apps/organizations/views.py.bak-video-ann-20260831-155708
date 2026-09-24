@@ -1,0 +1,719 @@
+# Copyright (C) 2021-2022 Intel Corporation
+# Copyright (C) CVAT.ai Corporation
+#
+# SPDX-License-Identifier: MIT
+
+from django.core.exceptions import ImproperlyConfigured
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from django.utils.crypto import get_random_string
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema, extend_schema_view
+from rest_framework import mixins, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.permissions import SAFE_METHODS
+from rest_framework.response import Response
+
+from cvat.apps.engine.mixins import PartialUpdateModelMixin
+from cvat.apps.iam.filters import ORGANIZATION_OPEN_API_PARAMETERS
+from cvat.apps.organizations.permissions import (
+    InvitationPermission,
+    MembershipPermission,
+    OrganizationPermission,
+)
+from cvat.apps.organizations.throttle import ResendOrganizationInvitationThrottle
+
+from drf_spectacular.utils import OpenApiResponse
+from .models import AIFunctionInstance, BailianSettings, FeatureKind, Invitation, Membership, Organization
+from .serializers import (
+    AIFunctionInstanceReadSerializer,
+    AIFunctionInstanceWriteSerializer,
+    AcceptInvitationReadSerializer,
+    BailianSettingsReadSerializer,
+    BailianSettingsWriteSerializer,
+    CreateMemberResultSerializer,
+    CreateMembersRequestSerializer,
+    InvitationReadSerializer,
+    InvitationWriteSerializer,
+    MembershipReadSerializer,
+    MembershipWriteSerializer,
+    OrganizationReadSerializer,
+    OrganizationWriteSerializer,
+)
+
+
+@extend_schema(tags=["organizations"])
+@extend_schema_view(
+    retrieve=extend_schema(
+        summary="Get organization details",
+        responses={
+            "200": OrganizationReadSerializer,
+        },
+    ),
+    list=extend_schema(
+        summary="List organizations",
+        responses={
+            "200": OrganizationReadSerializer(many=True),
+        },
+    ),
+    partial_update=extend_schema(
+        summary="Update an organization",
+        request=OrganizationWriteSerializer(partial=True),
+        responses={
+            "200": OrganizationReadSerializer,  # check OrganizationWriteSerializer.to_representation
+        },
+    ),
+    create=extend_schema(
+        summary="Create an organization",
+        request=OrganizationWriteSerializer,
+        responses={
+            "201": OrganizationReadSerializer,  # check OrganizationWriteSerializer.to_representation
+        },
+    ),
+    destroy=extend_schema(
+        summary="Delete an organization",
+        responses={
+            "204": OpenApiResponse(description="The organization has been deleted"),
+        },
+    ),
+)
+class OrganizationViewSet(
+    viewsets.GenericViewSet,
+    mixins.RetrieveModelMixin,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+    PartialUpdateModelMixin,
+):
+    queryset = Organization.objects.all()
+    search_fields = ("name", "owner", "slug")
+    simple_filters = search_fields
+    filter_fields = (*simple_filters, "id")
+    lookup_fields = {"owner": "owner__username"}
+    ordering_fields = list(filter_fields)
+    ordering = "-id"
+    http_method_names = ["get", "post", "patch", "delete", "head", "options"]
+    iam_supports_organization_params = False
+    iam_permission_class = OrganizationPermission
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        if self.action == "list":
+            queryset = queryset.prefetch_related("owner")
+            permission = OrganizationPermission.create_scope_list(self.request)
+            queryset = permission.filter(queryset)
+        else:
+            queryset = queryset.select_related("owner")
+
+        return queryset
+
+    def get_serializer_class(self):
+        if self.request.method in SAFE_METHODS:
+            return OrganizationReadSerializer
+        else:
+            return OrganizationWriteSerializer
+
+    def perform_create(self, serializer):
+        extra_kwargs = {"owner": self.request.user}
+        if not serializer.validated_data.get("name"):
+            extra_kwargs.update({"name": serializer.validated_data["slug"]})
+        serializer.save(**extra_kwargs)
+
+    @action(detail=True, methods=["GET", "PATCH"], url_path="bailian-settings")
+    def bailian_settings(self, request, pk=None):
+        organization = self.get_object()
+        settings_obj, _ = BailianSettings.objects.get_or_create(organization=organization)
+        if request.method in SAFE_METHODS:
+            serializer = BailianSettingsReadSerializer(settings_obj, context={"request": request})
+            return Response(serializer.data)
+
+        serializer = BailianSettingsWriteSerializer(
+            settings_obj, data=request.data, partial=True, context={"request": request}
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save(updated_by=request.user)
+        return Response(serializer.data)
+
+    @extend_schema(
+        operation_id="organizations_ai_function_instances_list",
+        summary="List AI function instances of an organization",
+        parameters=[
+            OpenApiParameter(
+                name="feature_kind",
+                location=OpenApiParameter.QUERY,
+                description="Filter by feature kind",
+                required=False,
+                type=str,
+                enum=[v for v, _ in FeatureKind.choices],
+            ),
+            OpenApiParameter(
+                name="provider",
+                location=OpenApiParameter.QUERY,
+                description="Filter by provider",
+                required=False,
+                type=str,
+            ),
+            OpenApiParameter(
+                name="is_enabled",
+                location=OpenApiParameter.QUERY,
+                description="Filter by enabled state",
+                required=False,
+                type=bool,
+            ),
+        ],
+        responses={"200": AIFunctionInstanceReadSerializer(many=True)},
+    )
+    @extend_schema(
+        operation_id="organizations_ai_function_instances_create",
+        summary="Create an AI function instance",
+        request=AIFunctionInstanceWriteSerializer,
+        responses={"201": AIFunctionInstanceReadSerializer},
+    )
+    @action(
+        detail=True,
+        methods=["GET", "POST"],
+        url_path="ai-function-instances",
+    )
+    def ai_function_instances(self, request, pk=None):
+        organization = self.get_object()
+        if request.method in SAFE_METHODS:
+            qs = AIFunctionInstance.objects.filter(organization=organization)
+            feature_kind = request.query_params.get("feature_kind")
+            provider = request.query_params.get("provider")
+            is_enabled = request.query_params.get("is_enabled")
+            if feature_kind:
+                qs = qs.filter(feature_kind=feature_kind)
+            if provider:
+                qs = qs.filter(provider=provider)
+            if is_enabled is not None:
+                enabled_val = str(is_enabled).lower() in {"1", "true", "yes", "on"}
+                qs = qs.filter(is_enabled=enabled_val)
+            qs = qs.select_related("updated_by").order_by("-is_default", "-updated_date")
+            serializer = AIFunctionInstanceReadSerializer(
+                qs, many=True, context={"request": request}
+            )
+            return Response(serializer.data)
+
+        serializer = AIFunctionInstanceWriteSerializer(
+            data=request.data,
+            context={"organization": organization, "updated_by": request.user},
+        )
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            if serializer.validated_data.get("is_default"):
+                (
+                    AIFunctionInstance.objects.filter(
+                        organization=organization,
+                        feature_kind=serializer.validated_data["feature_kind"],
+                        is_default=True,
+                    ).update(is_default=False)
+                )
+            instance = serializer.save()
+        return Response(
+            AIFunctionInstanceReadSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @extend_schema(
+        operation_id="organizations_ai_function_instances_probe",
+        summary="Probe an HTTP microservice predict API (GET /health and GET /labels)",
+        description=(
+            "Does not require a saved instance or an image. "
+            "POST {api_url} (or config.api_url). Optional instance_slug copies a stored api_key."
+        ),
+        request=None,
+        responses={"200": OpenApiResponse(description="Probe result")},
+    )
+    @action(
+        detail=True,
+        methods=["POST"],
+        url_path="ai-function-instances/probe",
+    )
+    def ai_function_instances_probe(self, request, pk=None):
+        organization = self.get_object()
+        data = request.data if isinstance(request.data, dict) else {}
+        cfg = {}
+        nested = data.get("config")
+        if isinstance(nested, dict):
+            cfg.update(nested)
+        for key in (
+            "api_url", "http_timeout_seconds", "api_key", "http_auth_header",
+        ):
+            if data.get(key) not in (None, ""):
+                cfg[key] = data.get(key)
+        if not cfg.get("api_url"):
+            slug = str(data.get("instance_slug") or data.get("slug") or "").strip()
+            if slug:
+                inst = AIFunctionInstance.objects.filter(
+                    organization=organization, slug=slug
+                ).first()
+                if inst and isinstance(inst.config, dict):
+                    for key in (
+                        "api_url", "http_timeout_seconds", "api_key", "http_auth_header",
+                    ):
+                        if key not in cfg and inst.config.get(key) not in (None, ""):
+                            cfg[key] = inst.config.get(key)
+        if not cfg.get("api_key"):
+            slug = str(data.get("instance_slug") or data.get("slug") or "").strip()
+            if slug:
+                inst = AIFunctionInstance.objects.filter(
+                    organization=organization, slug=slug
+                ).first()
+                if inst and isinstance(inst.config, dict) and inst.config.get("api_key"):
+                    cfg["api_key"] = inst.config.get("api_key")
+        from cvat.apps.lambda_manager.http_microservice import probe_http_microservice
+        result = probe_http_microservice(cfg)
+        return Response(result)
+
+    @extend_schema(
+        operation_id="organizations_ai_function_instances_retrieve",
+        summary="Get an AI function instance",
+        responses={"200": AIFunctionInstanceReadSerializer},
+    )
+    @extend_schema(
+        operation_id="organizations_ai_function_instances_partial_update",
+        summary="Update an AI function instance",
+        request=AIFunctionInstanceWriteSerializer(partial=True),
+        responses={"200": AIFunctionInstanceReadSerializer},
+    )
+    @extend_schema(
+        operation_id="organizations_ai_function_instances_destroy",
+        summary="Delete an AI function instance",
+        responses={"204": OpenApiResponse(description="Deleted")},
+    )
+    @action(
+        detail=True,
+        methods=["GET", "PATCH", "DELETE"],
+        url_path=r"ai-function-instances/(?P<instance_slug>[^/.]+)",
+    )
+    def ai_function_instance_detail(self, request, pk=None, instance_slug=None):
+        organization = self.get_object()
+        instance = get_object_or_404(
+            AIFunctionInstance, organization=organization, slug=instance_slug
+        )
+
+        if request.method == "DELETE":
+            instance.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        if request.method in SAFE_METHODS:
+            return Response(
+                AIFunctionInstanceReadSerializer(instance, context={"request": request}).data
+            )
+
+        serializer = AIFunctionInstanceWriteSerializer(
+            instance,
+            data=request.data,
+            partial=True,
+            context={"organization": organization, "updated_by": request.user},
+        )
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            new_is_default = serializer.validated_data.get("is_default")
+            if new_is_default and not instance.is_default:
+                AIFunctionInstance.objects.filter(
+                    organization=organization,
+                    feature_kind=instance.feature_kind,
+                    is_default=True,
+                ).exclude(pk=instance.pk).update(is_default=False)
+            instance = serializer.save()
+        return Response(
+            AIFunctionInstanceReadSerializer(instance, context={"request": request}).data
+        )
+
+    @extend_schema(
+        operation_id="organizations_ai_function_instances_enable",
+        summary="Enable an AI function instance",
+        request=None,
+        responses={"200": AIFunctionInstanceReadSerializer},
+    )
+    @action(
+        detail=True,
+        methods=["POST"],
+        url_path=r"ai-function-instances/(?P<instance_slug>[^/.]+)/enable",
+    )
+    def ai_function_instance_enable(self, request, pk=None, instance_slug=None):
+        organization = self.get_object()
+        instance = get_object_or_404(
+            AIFunctionInstance, organization=organization, slug=instance_slug
+        )
+        if not instance.is_enabled:
+            instance.is_enabled = True
+            instance.updated_by = request.user
+            instance.save(update_fields=["is_enabled", "updated_by", "updated_date"])
+        return Response(
+            AIFunctionInstanceReadSerializer(instance, context={"request": request}).data
+        )
+
+    @extend_schema(
+        operation_id="organizations_ai_function_instances_disable",
+        summary="Disable an AI function instance",
+        request=None,
+        responses={"200": AIFunctionInstanceReadSerializer},
+    )
+    @action(
+        detail=True,
+        methods=["POST"],
+        url_path=r"ai-function-instances/(?P<instance_slug>[^/.]+)/disable",
+    )
+    def ai_function_instance_disable(self, request, pk=None, instance_slug=None):
+        organization = self.get_object()
+        instance = get_object_or_404(
+            AIFunctionInstance, organization=organization, slug=instance_slug
+        )
+        if instance.is_enabled:
+            instance.is_enabled = False
+            instance.updated_by = request.user
+            instance.save(update_fields=["is_enabled", "updated_by", "updated_date"])
+        return Response(
+            AIFunctionInstanceReadSerializer(instance, context={"request": request}).data
+        )
+
+    @extend_schema(
+        operation_id="organizations_ai_function_instances_set_default",
+        summary="Mark an AI function instance as the default for its feature kind",
+        request=None,
+        responses={"200": AIFunctionInstanceReadSerializer},
+    )
+    @action(
+        detail=True,
+        methods=["POST"],
+        url_path=r"ai-function-instances/(?P<instance_slug>[^/.]+)/set-default",
+    )
+    def ai_function_instance_set_default(self, request, pk=None, instance_slug=None):
+        organization = self.get_object()
+        instance = get_object_or_404(
+            AIFunctionInstance, organization=organization, slug=instance_slug
+        )
+        with transaction.atomic():
+            AIFunctionInstance.objects.filter(
+                organization=organization,
+                feature_kind=instance.feature_kind,
+                is_default=True,
+            ).exclude(pk=instance.pk).update(is_default=False)
+            if not instance.is_default:
+                instance.is_default = True
+                instance.updated_by = request.user
+                instance.save(update_fields=["is_default", "updated_by", "updated_date"])
+        return Response(
+            AIFunctionInstanceReadSerializer(instance, context={"request": request}).data
+        )
+
+    @extend_schema(
+        operation_id="organizations_create_members",
+        summary="Directly create active member accounts for the organization",
+        description=(
+            "Create one or more user accounts with valid passwords and immediately activate them "
+            "as organization members. No email invitation flow is required. "
+            "Passwords are returned in the response (auto-generated if not provided) — save them securely.\n"
+            "Permission rules: Owner can create members with worker/supervisor/maintainer roles; "
+            "Maintainer can create members with worker/supervisor roles only."
+        ),
+        request=CreateMembersRequestSerializer,
+        responses={
+            "200": OpenApiResponse(
+                description="Members created (note: partial success possible, check errors field)"
+            ),
+            "403": OpenApiResponse(description="Forbidden: insufficient role"),
+        },
+    )
+    @action(
+        detail=True,
+        methods=["POST"],
+        url_path="create-members",
+    )
+    def create_members(self, request, pk=None):
+        organization = self.get_object()
+        self.check_object_permissions(request, organization)
+
+        current_membership = Membership.objects.filter(
+            organization=organization, user=request.user, is_active=True
+        ).first()
+        current_role = current_membership.role if current_membership else None
+        is_owner = current_role == Membership.OWNER
+        is_maintainer = current_role == Membership.MAINTAINER
+
+        if not (is_owner or is_maintainer):
+            return Response(
+                status=status.HTTP_403_FORBIDDEN,
+                data="Only organization owner or maintainer can create member accounts directly.",
+            )
+
+        allowed_roles = {Membership.WORKER, Membership.SUPERVISOR}
+        if is_owner:
+            allowed_roles.add(Membership.MAINTAINER)
+
+        members_payload = request.data.get("members", [])
+        for idx, item in enumerate(members_payload):
+            requested_role = item.get("role", Membership.WORKER)
+            if requested_role not in allowed_roles:
+                return Response(
+                    status=status.HTTP_403_FORBIDDEN,
+                    data=(
+                        f"Member at index {idx} has role '{requested_role}' which is not allowed "
+                        f"for your role '{current_role}'. Allowed roles: {sorted(allowed_roles)}."
+                    ),
+                )
+
+        serializer = CreateMembersRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        results, errors = serializer.create_members(organization, request)
+
+        return Response(
+            status=status.HTTP_200_OK,
+            data={
+                "created_count": len(results),
+                "error_count": len(errors),
+                "results": CreateMemberResultSerializer(results, many=True).data,
+                "errors": errors,
+            },
+        )
+
+
+@extend_schema(tags=["memberships"])
+@extend_schema_view(
+    retrieve=extend_schema(
+        summary="Get membership details",
+        responses={
+            "200": MembershipReadSerializer,
+        },
+    ),
+    list=extend_schema(
+        summary="List memberships",
+        responses={
+            "200": MembershipReadSerializer(many=True),
+        },
+    ),
+    partial_update=extend_schema(
+        summary="Update a membership",
+        request=MembershipWriteSerializer(partial=True),
+        responses={
+            "200": MembershipReadSerializer,  # check MembershipWriteSerializer.to_representation
+        },
+    ),
+    destroy=extend_schema(
+        summary="Delete a membership",
+        responses={
+            "204": OpenApiResponse(description="The membership has been deleted"),
+        },
+    ),
+)
+class MembershipViewSet(
+    mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
+    mixins.ListModelMixin,
+    PartialUpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    queryset = Membership.objects.all()
+    ordering = "-id"
+    http_method_names = ["get", "patch", "delete", "head", "options"]
+    search_fields = ("user",)
+    simple_filters = (*search_fields, "role")
+    filter_fields = (*simple_filters, "id")
+    ordering_fields = list(filter_fields)
+    lookup_fields = {"user": "user__username"}
+    iam_supports_organization_params = True
+    iam_permission_class = MembershipPermission
+
+    def get_serializer_class(self):
+        if self.request.method in SAFE_METHODS:
+            return MembershipReadSerializer
+        else:
+            return MembershipWriteSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+
+        if self.action == "list":
+            queryset = queryset.prefetch_related("invitation", "user")
+            permission = MembershipPermission.create_scope_list(self.request)
+            queryset = permission.filter(queryset)
+        else:
+            queryset = queryset.select_related("invitation", "user")
+
+        return queryset
+
+
+@extend_schema(tags=["invitations"])
+@extend_schema_view(
+    retrieve=extend_schema(
+        summary="Get invitation details",
+        responses={
+            "200": InvitationReadSerializer,
+        },
+    ),
+    list=extend_schema(
+        summary="List invitations",
+        responses={
+            "200": InvitationReadSerializer(many=True),
+        },
+    ),
+    create=extend_schema(
+        summary="Create an invitation",
+        request=InvitationWriteSerializer,
+        parameters=ORGANIZATION_OPEN_API_PARAMETERS,
+        responses={
+            "201": InvitationReadSerializer,  # check InvitationWriteSerializer.to_representation
+        },
+    ),
+    destroy=extend_schema(
+        summary="Delete an invitation",
+        responses={
+            "204": OpenApiResponse(description="The invitation has been deleted"),
+        },
+    ),
+    accept=extend_schema(
+        operation_id="invitations_accept",
+        request=None,
+        summary="Accept an invitation",
+        responses={
+            "200": OpenApiResponse(
+                response=AcceptInvitationReadSerializer, description="The invitation is accepted"
+            ),
+            "400": OpenApiResponse(description="The invitation is expired or already accepted"),
+        },
+    ),
+    decline=extend_schema(
+        operation_id="invitations_decline",
+        request=None,
+        summary="Decline an invitation",
+        responses={
+            "204": OpenApiResponse(description="The invitation has been declined"),
+        },
+    ),
+    resend=extend_schema(
+        operation_id="invitations_resend",
+        summary="Resend an invitation",
+        request=None,
+        responses={
+            "204": OpenApiResponse(description="Invitation has been sent"),
+            "400": OpenApiResponse(description="The invitation is already accepted"),
+        },
+    ),
+)
+class InvitationViewSet(
+    viewsets.GenericViewSet,
+    mixins.RetrieveModelMixin,
+    mixins.ListModelMixin,
+    mixins.CreateModelMixin,
+    mixins.DestroyModelMixin,
+):
+    queryset = Invitation.objects.all()
+    http_method_names = ["get", "post", "delete", "head", "options"]
+    iam_supports_organization_params = True
+    iam_permission_class = InvitationPermission
+
+    search_fields = ("owner",)
+    simple_filters = (*search_fields, "user_id", "accepted")
+    filter_fields = (*simple_filters, "id")
+    ordering_fields = list(simple_filters) + ["created_date"]
+    ordering = "-created_date"
+    lookup_fields = {
+        "owner": "owner__username",
+        "user_id": "membership__user__id",
+        "accepted": "membership__is_active",
+    }
+
+    def get_serializer_class(self):
+        if self.request.method in SAFE_METHODS:
+            return InvitationReadSerializer
+        else:
+            return InvitationWriteSerializer
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        related = ("owner", "membership__user", "membership__organization")
+
+        if self.action == "list":
+            queryset = queryset.prefetch_related(*related)
+            permission = InvitationPermission.create_scope_list(self.request)
+            queryset = permission.filter(queryset)
+        else:
+            queryset = queryset.select_related(*related)
+
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            self.perform_create(serializer)
+        except ImproperlyConfigured:
+            return Response(
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                data="Email backend is not configured.",
+            )
+
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    def perform_create(self, serializer):
+        serializer.save(
+            owner=self.request.user,
+            key=get_random_string(length=64),
+            organization=self.request.iam_context["organization"],
+            request=self.request,
+        )
+
+    @transaction.atomic
+    @action(detail=True, methods=["POST"], url_path="accept")
+    def accept(self, request, pk):
+        try:
+            invitation = self.get_object()  # force to call check_object_permissions
+            if invitation.expired:
+                return Response(
+                    status=status.HTTP_400_BAD_REQUEST,
+                    data="Your invitation is expired. Please contact organization owner to renew it.",
+                )
+            if invitation.membership.is_active:
+                return Response(
+                    status=status.HTTP_400_BAD_REQUEST, data="Your invitation is already accepted."
+                )
+            invitation.accept()
+            response_serializer = AcceptInvitationReadSerializer(
+                data={"organization_slug": invitation.membership.organization.slug}
+            )
+            response_serializer.is_valid(raise_exception=True)
+            return Response(status=status.HTTP_200_OK, data=response_serializer.data)
+        except Invitation.DoesNotExist:
+            return Response(
+                status=status.HTTP_404_NOT_FOUND,
+                data="This invitation does not exist. Please contact organization owner.",
+            )
+
+    @action(
+        detail=True,
+        methods=["POST"],
+        url_path="resend",
+        throttle_classes=[ResendOrganizationInvitationThrottle],
+    )
+    def resend(self, request, pk):
+        try:
+            invitation = self.get_object()  # force to call check_object_permissions
+            if invitation.membership.is_active:
+                return Response(
+                    status=status.HTTP_400_BAD_REQUEST, data="This invitation is already accepted."
+                )
+            invitation.send(request)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Invitation.DoesNotExist:
+            return Response(
+                status=status.HTTP_404_NOT_FOUND, data="This invitation does not exist."
+            )
+        except ImproperlyConfigured:
+            return Response(
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                data="Email backend is not configured.",
+            )
+
+    @action(detail=True, methods=["POST"], url_path="decline")
+    def decline(self, request, pk):
+        try:
+            invitation = self.get_object()  # force to call check_object_permissions
+            membership = invitation.membership
+            membership.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        except Invitation.DoesNotExist:
+            return Response(
+                status=status.HTTP_404_NOT_FOUND, data="This invitation does not exist."
+            )

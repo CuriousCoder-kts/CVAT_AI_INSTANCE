@@ -1,0 +1,1109 @@
+"""Generic HTTP multipart detector for CVAT Automatic annotation.
+
+POSTs the current frame as multipart/form-data to a configurable microservice
+(e.g. ``POST http://host:8080/predict`` with ``image=@file`` plus extra fields
+such as ``layout_on_box=1``), then maps JSON → CVAT lambda detector items.
+
+This is the reusable replacement for model-specific local ONNX wiring
+(CLRerNet). Detection is config-driven, not book-layout-specific.
+
+Config keys (AIFunctionInstance.config)
+--------------------------------------
+api_url                 Full predict URL (required). Query string is kept as-is, e.g.
+                        http://192.168.50.42:8081/predict?conf_thres=0.43&min_points=6
+http_file_field         Multipart file field name (default: ``image``)
+http_form_fields        Extra form fields: dict, list[{key,value}], or ``a=1&b=2``
+http_query_fields       Optional extra query-string dict (merged onto api_url, does not strip it)
+http_timeout_seconds    Request timeout (default 120)
+http_auth_header        Optional header name for api_key (default Authorization Bearer)
+local_backend / vision_backend
+                        ``http`` / ``http_microservice`` / ``http_detector``
+model                   ``http_detector`` (or any ``http_*``) also selects this path
+output_parser_config    bbox_format: auto|xyxy|xywh
+                        coordinate_system: real_pixel|normalized_0_1|canonical_1000
+                        confidence_threshold_default
+
+Optional sibling endpoints (no image required; used by Test connection)
+----------------------------------------------------------------------
+GET {origin}/health     ``{"status": "ok"}`` (404 is fine — optional)
+GET {origin}/labels     ``{"labels": [{"name": "lane", "type": "polyline"}, ...]}``
+                        404 keeps the instance Labels tab as-is.
+
+Stable object ids (video → CVAT tracks)
+--------------------------------------
+Automatic annotation groups boxes into tracks only when a shape has
+``track_id`` / ``object_id`` / ``instance_id`` (same value across frames).
+A generic ``id`` field is ignored so existing /predict APIs that number
+boxes per frame are not turned into tracks by accident.
+
+Same-frame families (``parent_index``)
+-------------------------------------
+Child shapes (keypoints, Rear box, …) may omit ``track_id`` and point at the
+parent via ``parent_index`` (index into this frame's ``shapes`` array). The
+parser assigns a CVAT ``group_id`` to the family and copies the parent's
+track id onto children. With a track id the group id is a stable hash so the
+same vehicle stays grouped across frames; without one, the group is unique
+to this parse call so frame N's index 0 does not collide with frame N+1.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import math
+import os
+from typing import Any
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+
+HTTP_BACKENDS = frozenset({
+    "http",
+    "http_microservice",
+    "http_detector",
+    "http_post",
+    "generic_http",
+})
+HTTP_MODELS = frozenset({
+    "http_detector",
+    "http_microservice",
+    "http_post",
+    "generic_http",
+})
+
+DEFAULT_FILE_FIELD = "image"
+DEFAULT_TIMEOUT = 120.0
+
+# Used only when the instance has no labels of its own (avoids the 9-class
+# traffic fallback on the HTTP path). Preset-supplied labels take precedence.
+DEFAULT_HTTP_INJECT_LABELS: list[dict[str, Any]] = [
+    {"name": "object", "type": "any", "attributes": []},
+]
+
+_ATTR_SKIP = frozenset({
+    "label", "class", "class_name", "category", "name", "cls", "type",
+    "points", "polygon", "polyline", "vertices", "coords", "box", "bbox",
+    "rotated_box", "rbox", "confidence", "score", "prob", "probability",
+    "mask", "mask_rle", "segmentation",
+    "id", "track_id", "object_id", "instance_id", "group", "group_id",
+})
+
+# Do not treat generic ``id`` as a track key: existing /predict APIs often use
+# per-frame box indexes. Colleague video API should send track_id / object_id.
+_TRACK_ID_KEYS = ("track_id", "object_id", "instance_id")
+
+
+def cfg_is_http_microservice(cfg: dict | None) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    backend = str(
+        cfg.get("local_backend") or cfg.get("vision_backend") or ""
+    ).strip().lower()
+    model = str(cfg.get("model") or "").strip().lower()
+    exec_mode = str(cfg.get("execution_mode") or "").strip().lower()
+    api_url = str(cfg.get("api_url") or "").strip()
+
+    # Trackers (HTTP /track or local DIS) must not be treated as detectors.
+    blob = f"{backend} {model} {api_url}".lower()
+    if "tracker" in blob or "optical_flow" in blob or "optical-flow" in blob or "/track" in api_url.lower():
+        return False
+
+    if backend in HTTP_BACKENDS:
+        return True
+    if model in HTTP_MODELS or model.startswith("http_"):
+        return True
+    if cfg.get("http_form_fields") or cfg.get("http_file_field") or cfg.get("http_query_fields"):
+        return True
+    if exec_mode == "vision_pipeline" and api_url:
+        url_l = api_url.lower()
+        if "chat/completions" in url_l or "dashscope" in url_l:
+            return False
+        if "clrernet" in model:
+            return False
+        return True
+    return False
+
+
+def _as_fields(raw: Any) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if raw is None:
+        return out
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            if k is None or v is None:
+                continue
+            key = str(k).strip()
+            if not key:
+                continue
+            if isinstance(v, bool):
+                out[key] = "1" if v else "0"
+            else:
+                out[key] = str(v)
+        return out
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                key = str(item.get("key") or item.get("name") or "").strip()
+                if not key:
+                    continue
+                val = item.get("value")
+                if val is None:
+                    val = item.get("val")
+                out[key] = "" if val is None else str(val)
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                key = str(item[0]).strip()
+                if key:
+                    out[key] = str(item[1])
+        return out
+    if isinstance(raw, str) and raw.strip():
+        text = raw.strip()
+        if text.startswith("{") or text.startswith("["):
+            try:
+                return _as_fields(json.loads(text))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        for pair in text.replace(";", "&").split("&"):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                k = k.strip()
+                if k:
+                    out[k] = v.strip()
+    return out
+
+
+def _guess_image_meta(data: bytes) -> tuple[str, str]:
+    if data[:3] == b"\xff\xd8\xff":
+        return "frame.jpg", "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "frame.png", "image/png"
+    if data[:2] == b"BM":
+        return "frame.bmp", "image/bmp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "frame.gif", "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "frame.webp", "image/webp"
+    return "frame.jpg", "image/jpeg"
+
+
+def _decode_image_b64(image_b64: str) -> bytes:
+    raw = (image_b64 or "").strip()
+    if not raw:
+        return b""
+    if raw.startswith("data:") and "," in raw:
+        raw = raw.split(",", 1)[1]
+    return base64.b64decode(raw)
+
+
+# Detector dual-head placeholder (8082 /labels dual includes "None").
+# Never promote these to a CVAT label.
+_SKIP_LABEL_NAMES = frozenset({
+    "", "none", "null", "nil", "n/a", "na", "nan", "-", "unknown", "nones",
+})
+
+
+def is_placeholder_label(name: str | None) -> bool:
+    return str(name or "").strip().lower() in _SKIP_LABEL_NAMES
+
+
+def _label_of(item: dict) -> str:
+    for key in ("label", "class_name", "class", "category", "name", "cls"):
+        v = item.get(key)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return "object"
+
+
+def _score_of(item: dict) -> float:
+    for key in ("confidence", "score", "prob", "probability"):
+        v = item.get(key)
+        if v is None:
+            continue
+        try:
+            return max(0.0, min(1.0, float(v)))
+        except (TypeError, ValueError):
+            continue
+    return 1.0
+
+
+def _flatten_points(raw: Any) -> list[float] | None:
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    first = raw[0]
+    if isinstance(first, (list, tuple)):
+        flat: list[float] = []
+        for pt in raw:
+            if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+                return None
+            try:
+                flat.append(float(pt[0]))
+                flat.append(float(pt[1]))
+            except (TypeError, ValueError):
+                return None
+        return flat if len(flat) >= 2 else None
+    try:
+        nums = [float(x) for x in raw]
+    except (TypeError, ValueError):
+        return None
+    return nums if len(nums) >= 2 else None
+
+
+def _rotated_box_to_polygon(rb: Any) -> list[float] | None:
+    if not isinstance(rb, (list, tuple)) or len(rb) < 5:
+        return None
+    try:
+        cx, cy, w, h, ang = (float(rb[0]), float(rb[1]), float(rb[2]), float(rb[3]), float(rb[4]))
+    except (TypeError, ValueError):
+        return None
+    hw, hh = w / 2.0, h / 2.0
+    corners = ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))
+    cos_a, sin_a = math.cos(ang), math.sin(ang)
+    out: list[float] = []
+    for x, y in corners:
+        out.append(cx + x * cos_a - y * sin_a)
+        out.append(cy + x * sin_a + y * cos_a)
+    return out
+
+
+def _looks_normalized(nums: list[float]) -> bool:
+    if not nums:
+        return False
+    return max(abs(x) for x in nums) <= 1.5
+
+
+def _scale_coords(
+    nums: list[float],
+    image_size: tuple[int, int],
+    coordinate_system: str,
+) -> list[float]:
+    width, height = image_size
+    system = (coordinate_system or "real_pixel").strip().lower()
+    if system == "auto":
+        system = "normalized_0_1" if _looks_normalized(nums) else "real_pixel"
+    scaled: list[float] = []
+    for i, v in enumerate(nums):
+        side = width if i % 2 == 0 else height
+        if system == "normalized_0_1":
+            scaled.append(float(v) * float(side))
+        elif system == "canonical_1000":
+            scaled.append(float(v) / 1000.0 * float(side))
+        else:
+            scaled.append(float(v))
+    return scaled
+
+
+def _box4_to_xyxy(
+    vals: list[float],
+    image_size: tuple[int, int],
+    bbox_format: str,
+) -> list[float]:
+    x, y, a, b = vals[0], vals[1], vals[2], vals[3]
+    fmt = (bbox_format or "auto").strip().lower()
+    if fmt in ("xywh", "xywh_pixel", "coco"):
+        return [x, y, x + a, y + b]
+    if fmt in ("xyxy", "x1y1x2y2"):
+        return [x, y, a, b]
+    width, height = image_size
+    # auto: prefer xyxy when the 3rd/4th look like a bottom-right corner
+    if a >= x and b >= y:
+        return [x, y, a, b]
+    if a >= 0 and b >= 0 and (x + a) <= (width * 1.05 + 1) and (y + b) <= (height * 1.05 + 1):
+        return [x, y, x + a, y + b]
+    return [x, y, a, b]
+
+
+def _clip_xyxy(box: list[float], image_size: tuple[int, int]) -> list[float] | None:
+    width, height = image_size
+    xtl = max(0.0, min(box[0], box[2]))
+    ytl = max(0.0, min(box[1], box[3]))
+    xbr = min(float(width), max(box[0], box[2]))
+    ybr = min(float(height), max(box[1], box[3]))
+    if xbr <= xtl or ybr <= ytl:
+        return None
+    return [xtl, ytl, xbr, ybr]
+
+
+def _clip_points(pts: list[float], image_size: tuple[int, int]) -> list[float]:
+    width, height = image_size
+    out: list[float] = []
+    for i, v in enumerate(pts):
+        side = width if i % 2 == 0 else height
+        out.append(max(0.0, min(float(side), float(v))))
+    return out
+
+
+def _shape_type(item: dict, n_coords: int, preferred: str = "") -> str:
+    raw = str(item.get("type") or "").strip().lower()
+    aliases = {
+        "rect": "rectangle",
+        "bbox": "rectangle",
+        "box": "rectangle",
+        "bounding_box": "rectangle",
+        "poly": "polygon",
+        "obb": "polygon",
+        "rotated_box": "polygon",
+        "line": "polyline",
+        "linestring": "polyline",
+        "linestringz": "polyline",
+        "curve": "polyline",
+        "lane": "polyline",
+        "keypoint": "points",
+        "keypoints": "points",
+        "point": "points",
+        "caption": "tag",
+    }
+    mapped = aliases.get(raw, raw)
+    if mapped in {"rectangle", "polygon", "polyline", "points", "tag", "ellipse", "mask"}:
+        if mapped == "rectangle" and n_coords >= 8:
+            return "polygon"
+        return mapped
+    pref = (preferred or "").strip().lower()
+    if pref in {"polyline", "polylines"} and n_coords >= 4:
+        return "polyline"
+    if n_coords >= 8:
+        return "polygon"
+    if n_coords == 4:
+        return "rectangle"
+    if n_coords >= 6:
+        return "polyline"
+    return "points"
+
+
+def _attributes_of(item: dict) -> list[dict[str, str]]:
+    attrs: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(name: str, value: Any) -> None:
+        key = str(name).strip()
+        if not key or key in seen or key.lower() in _ATTR_SKIP:
+            return
+        if isinstance(value, (dict, list)):
+            try:
+                text = json.dumps(value, ensure_ascii=False)
+            except (TypeError, ValueError):
+                text = str(value)
+        else:
+            text = str(value)
+        if len(text) > 512:
+            text = text[:512]
+        seen.add(key)
+        attrs.append({"name": key[:64], "value": text})
+
+    raw_attrs = item.get("attributes")
+    if isinstance(raw_attrs, list):
+        for a in raw_attrs:
+            if isinstance(a, dict) and a.get("name"):
+                _add(str(a.get("name")), a.get("value", ""))
+    elif isinstance(raw_attrs, dict):
+        for k, v in raw_attrs.items():
+            _add(str(k), v)
+    for extra_key in ("source", "parent_index", "parent", "visibility"):
+        if extra_key in item and item[extra_key] is not None:
+            _add(extra_key, item[extra_key])
+    return attrs
+
+
+def extract_object_track_id(item: dict | None) -> str | None:
+    """Stable object id from a colleague /predict item (same id across frames)."""
+    if not isinstance(item, dict):
+        return None
+    for key in _TRACK_ID_KEYS:
+        if key in item and item[key] is not None:
+            text = str(item[key]).strip()
+            if text:
+                return text
+    raw_attrs = item.get("attributes")
+    if isinstance(raw_attrs, list):
+        for attr in raw_attrs:
+            if not isinstance(attr, dict):
+                continue
+            name = str(attr.get("name") or "").strip().lower().replace("-", "_")
+            if name in _TRACK_ID_KEYS or name in {"objectid", "trackid", "object_id"}:
+                text = str(attr.get("value", "")).strip()
+                if text:
+                    return text
+    elif isinstance(raw_attrs, dict):
+        for key in _TRACK_ID_KEYS:
+            if key in raw_attrs and raw_attrs[key] is not None:
+                text = str(raw_attrs[key]).strip()
+                if text:
+                    return text
+    return None
+
+
+def _parent_index_of(item: dict | None) -> int | None:
+    """0-based index into this frame's shapes array (``parent_index`` / ``parent``)."""
+    if not isinstance(item, dict):
+        return None
+    for key in ("parent_index", "parent"):
+        raw = item.get(key)
+        if raw is None or isinstance(raw, (dict, list, bool)):
+            continue
+        try:
+            idx = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if idx >= 0:
+            return idx
+    return None
+
+
+def _stable_group_id(seed: str) -> int:
+    """Positive 31-bit int so the same seed (track_id) maps to the same CVAT group."""
+    digest = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    n = int(digest[:8], 16) & 0x7FFFFFFF
+    return n if n else 1
+
+
+def _apply_family_links(raw_items: list[dict], recs: list[dict | None]) -> None:
+    """Set ``group_id`` from ``parent_index`` and copy parent ``track_id`` onto children."""
+    n = len(raw_items)
+    if n != len(recs):
+        return
+
+    def parent_idx(i: int) -> int | None:
+        if i < 0 or i >= n:
+            return None
+        p = _parent_index_of(raw_items[i])
+        if p is None or p < 0 or p >= n or p == i:
+            return None
+        if recs[p] is None:
+            return None
+        return p
+
+    def root_idx(i: int) -> int:
+        seen: set[int] = set()
+        cur = i
+        while True:
+            if cur in seen:
+                return cur
+            seen.add(cur)
+            p = parent_idx(cur)
+            if p is None:
+                return cur
+            cur = p
+
+    root_of: list[int | None] = [None] * n
+    for i, rec in enumerate(recs):
+        if rec is None:
+            continue
+        root_of[i] = root_idx(i)
+
+    family_size: dict[int, int] = {}
+    for r in root_of:
+        if r is None:
+            continue
+        family_size[r] = family_size.get(r, 0) + 1
+
+    root_group: dict[int, int] = {}
+    root_track: dict[int, str] = {}
+    for i, rec in enumerate(recs):
+        if rec is None:
+            continue
+        r = root_of[i]
+        if r is None:
+            continue
+        if r not in root_group:
+            root_rec = recs[r] if recs[r] is not None else rec
+            tid = (root_rec.get("track_id") if isinstance(root_rec, dict) else None) or (
+                extract_object_track_id(raw_items[r]) if 0 <= r < n else None
+            )
+            if tid:
+                root_track[r] = str(tid)
+                root_group[r] = _stable_group_id(f"tid:{tid}")
+            else:
+                root_group[r] = _stable_group_id(f"anon:{id(recs)}:{r}")
+        if i != r and r in root_track and not rec.get("track_id"):
+            rec["track_id"] = root_track[r]
+        grouped = family_size.get(r, 0) > 1 or _parent_index_of(raw_items[i]) is not None
+        if grouped:
+            rec["group_id"] = root_group[r]
+
+
+def _collect_item_dicts(payload: Any) -> list[dict]:
+    if isinstance(payload, list):
+        out: list[dict] = []
+        for x in payload:
+            if isinstance(x, dict):
+                out.append(x)
+            elif isinstance(x, (list, tuple)) and len(x) >= 4:
+                try:
+                    out.append({
+                        "label": "object",
+                        "type": "rectangle",
+                        "points": [float(x[0]), float(x[1]), float(x[2]), float(x[3])],
+                    })
+                except (TypeError, ValueError):
+                    continue
+        return out
+    if not isinstance(payload, dict):
+        return []
+    for key in (
+        "shapes", "objects", "annotations", "detections", "items",
+        "results", "instances", "boxes", "labels", "layout", "regions",
+        "lanes", "polylines", "lines", "line_strings",
+    ):
+        v = payload.get(key)
+        if isinstance(v, list) and v:
+            nested = _collect_item_dicts(v)
+            if nested:
+                return nested
+    # single-object dict that already looks like a shape
+    if any(k in payload for k in (
+        "points", "box", "bbox", "polygon", "polyline", "rotated_box",
+        "vertices", "coords",
+    )):
+        return [payload]
+    return []
+
+
+def _parse_one_shape(
+    item: dict,
+    *,
+    image_size: tuple[int, int],
+    bbox_format: str,
+    coordinate_system: str,
+    preferred_shape: str,
+    threshold: float,
+) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    conf = _score_of(item)
+    if conf < threshold:
+        return None
+    label = _label_of(item)
+    if is_placeholder_label(label):
+        return None
+
+    pts: list[float] | None = None
+    pts_from: str | None = None
+    for key in ("points", "polygon", "polyline", "vertices", "coords"):
+        pts = _flatten_points(item.get(key))
+        if pts is not None:
+            pts_from = key
+            break
+    if pts is None:
+        for key in ("box", "bbox"):
+            raw_box = _flatten_points(item.get(key))
+            if raw_box is not None and len(raw_box) >= 4:
+                pts = _box4_to_xyxy(raw_box, image_size, bbox_format)
+                item = {**item, "type": item.get("type") or "rectangle"}
+                pts_from = key
+                break
+    if pts is None:
+        rb = _rotated_box_to_polygon(item.get("rotated_box") or item.get("rbox"))
+        if rb is not None:
+            pts = rb
+            item = {**item, "type": item.get("type") or "polygon"}
+            pts_from = "rotated_box"
+    if pts is None:
+        return None
+
+    if not str(item.get("type") or "").strip():
+        if pts_from == "polyline":
+            item = {**item, "type": "polyline"}
+        elif pts_from == "polygon":
+            item = {**item, "type": "polygon"}
+
+    pts = _scale_coords(pts, image_size, coordinate_system)
+    shape_type = _shape_type(item, len(pts), preferred_shape)
+    if shape_type == "tag":
+        return {
+            "label": label,
+            "type": "tag",
+            "confidence": str(round(conf, 4)),
+            "attributes": _attributes_of(item),
+        }
+    if shape_type == "rectangle":
+        if len(pts) >= 8:
+            xs = pts[0::2]
+            ys = pts[1::2]
+            box = _clip_xyxy([min(xs), min(ys), max(xs), max(ys)], image_size)
+        elif len(pts) >= 4:
+            box = _clip_xyxy(pts[:4], image_size)
+        else:
+            return None
+        if box is None:
+            return None
+        points_out: list[float] = [round(v, 2) for v in box]
+    else:
+        if len(pts) % 2 == 1:
+            pts = pts[:-1]
+        min_n = 6 if shape_type == "polygon" else (4 if shape_type == "polyline" else 2)
+        if len(pts) < min_n:
+            return None
+        points_out = [round(v, 2) for v in _clip_points(pts, image_size)]
+
+    rec: dict[str, Any] = {
+        "label": label,
+        "type": shape_type,
+        "points": points_out,
+        "confidence": str(round(conf, 4)),
+    }
+    track_id = extract_object_track_id(item)
+    if track_id:
+        rec["track_id"] = track_id
+    attrs = _attributes_of(item)
+    if attrs:
+        rec["attributes"] = attrs
+    return rec
+
+
+def parse_microservice_json(
+    payload: Any,
+    *,
+    image_size: tuple[int, int] = (0, 0),
+    parser_config: dict | None = None,
+    threshold: float | None = None,
+) -> list[dict[str, Any]]:
+    """Convert a microservice JSON body into CVAT lambda detector items."""
+    cfg = parser_config if isinstance(parser_config, dict) else {}
+    if isinstance(payload, dict):
+        env_w = payload.get("width")
+        env_h = payload.get("height")
+        try:
+            if int(env_w or 0) > 0 and int(env_h or 0) > 0:
+                image_size = (int(env_w), int(env_h))
+        except (TypeError, ValueError):
+            pass
+        code = payload.get("code")
+        if code not in (None, 0, "0", "ok", "success", True):
+            msg = str(payload.get("message") or payload.get("error") or code)
+            raise RuntimeError(f"microservice returned error code={code}: {msg[:240]}")
+
+    width, height = image_size
+    if width <= 0:
+        width = 1
+    if height <= 0:
+        height = 1
+    image_size = (width, height)
+
+    bbox_format = str(cfg.get("bbox_format") or "auto")
+    coordinate_system = str(cfg.get("coordinate_system") or "real_pixel")
+    preferred_shape = str(
+        cfg.get("preferred_shape_type") or cfg.get("output_format") or ""
+    )
+    thr = (
+        float(threshold)
+        if isinstance(threshold, (int, float))
+        else float(cfg.get("confidence_threshold_default", 0.0) or 0.0)
+    )
+    thr = max(0.0, min(1.0, thr))
+
+    items = _collect_item_dicts(payload)
+    recs: list[dict[str, Any] | None] = [
+        _parse_one_shape(
+            item,
+            image_size=image_size,
+            bbox_format=bbox_format,
+            coordinate_system=coordinate_system,
+            preferred_shape=preferred_shape,
+            threshold=thr,
+        )
+        for item in items
+    ]
+    _apply_family_links(items, recs)
+    return [rec for rec in recs if rec is not None]
+
+
+_LABEL_TYPE_ALIASES = {
+    "rect": "rectangle",
+    "bbox": "rectangle",
+    "box": "rectangle",
+    "bounding_box": "rectangle",
+    "poly": "polygon",
+    "obb": "polygon",
+    "rotated_box": "polygon",
+    "line": "polyline",
+    "linestring": "polyline",
+    "linestringz": "polyline",
+    "curve": "polyline",
+    "lane": "polyline",
+    "keypoint": "points",
+    "keypoints": "points",
+    "point": "points",
+    "caption": "tag",
+}
+_ALLOWED_LABEL_TYPES = frozenset({
+    "rectangle", "polygon", "polyline", "points", "tag", "any", "ellipse", "mask",
+})
+_PREDICT_PATH_NAMES = frozenset({
+    "predict", "inference", "detect", "forward", "run", "annotate",
+})
+
+
+def sibling_endpoint_url(api_url: str, name: str) -> str:
+    """Turn ``.../predict?x=1`` into ``.../health`` or ``.../labels`` (query stripped)."""
+    parsed = urlparse((api_url or "").strip())
+    path = parsed.path or "/"
+    if path.endswith("/") and path != "/":
+        path = path[:-1]
+    leaf = name.strip().strip("/") or "health"
+    if not path or path == "/":
+        new_path = f"/{leaf}"
+    else:
+        parent, _, last = path.rpartition("/")
+        if last.lower() in _PREDICT_PATH_NAMES:
+            new_path = f"{parent}/{leaf}" if parent else f"/{leaf}"
+        else:
+            new_path = f"{path}/{leaf}"
+    if not new_path.startswith("/"):
+        new_path = "/" + new_path
+    return urlunparse(parsed._replace(path=new_path, query="", fragment=""))
+
+
+def _normalize_label_type(raw: Any) -> str:
+    mapped = str(raw or "any").strip().lower()
+    mapped = _LABEL_TYPE_ALIASES.get(mapped, mapped)
+    if mapped not in _ALLOWED_LABEL_TYPES:
+        return "any"
+    return mapped
+
+
+def _sanitize_label_name(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text[0].isdigit():
+        text = "c_" + text
+    cleaned = []
+    for ch in text:
+        if ch.isalnum() or ch in ("_", "-"):
+            cleaned.append(ch)
+        elif ch in (" ", ".", "/"):
+            cleaned.append("_")
+    name = "".join(cleaned).strip("_-")
+    if not name:
+        return ""
+    if not name[0].isalpha() and name[0] != "_":
+        name = "c_" + name
+    return name[:64]
+
+
+def parse_labels_payload(payload: Any) -> list[dict[str, Any]]:
+    """Parse GET /labels JSON into ``[{name, type, description?}]``."""
+    raw_list: list[Any] = []
+    if isinstance(payload, list):
+        raw_list = payload
+    elif isinstance(payload, dict):
+        code = payload.get("code")
+        if code not in (None, 0, "0", "ok", "success", True):
+            msg = str(payload.get("message") or payload.get("error") or code)
+            raise RuntimeError(f"GET /labels returned error code={code}: {msg[:240]}")
+        for key in ("labels", "classes", "categories", "items", "names"):
+            v = payload.get(key)
+            if isinstance(v, list) and v:
+                raw_list = v
+                break
+        if not raw_list and (payload.get("name") or payload.get("label")):
+            raw_list = [payload]
+        if not raw_list:
+            skip = {
+                "code", "message", "status", "ok", "error", "width", "height",
+                "elapsed_ms", "name",
+            }
+            maybe = {
+                k: v for k, v in payload.items()
+                if k not in skip and isinstance(k, str) and isinstance(v, (str, dict))
+            }
+            for k, v in maybe.items():
+                if isinstance(v, str):
+                    raw_list.append({"name": k, "type": v})
+                elif isinstance(v, dict):
+                    raw_list.append({"name": v.get("name") or k, **v})
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw_list:
+        name = ""
+        typ = "any"
+        desc = ""
+        if isinstance(item, str):
+            name = item
+        elif isinstance(item, dict):
+            name = str(
+                item.get("name") or item.get("label") or item.get("class")
+                or item.get("class_name") or item.get("category") or ""
+            ).strip()
+            typ = _normalize_label_type(item.get("type") or item.get("shape") or item.get("kind"))
+            desc = str(item.get("description") or item.get("desc") or "").strip()
+        else:
+            continue
+        name = _sanitize_label_name(name)
+        if not name or is_placeholder_label(name):
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        rec: dict[str, Any] = {"name": name, "type": typ}
+        if desc:
+            rec["description"] = desc[:240]
+        out.append(rec)
+    return out
+
+
+def _probe_auth_headers(cfg: dict | None) -> dict[str, str]:
+    cfg = cfg if isinstance(cfg, dict) else {}
+    api_key = str(cfg.get("api_key") or "").strip()
+    if not api_key:
+        return {}
+    header_name = str(cfg.get("http_auth_header") or "Authorization").strip() or "Authorization"
+    if header_name.lower() == "authorization" and not api_key.lower().startswith("bearer "):
+        return {header_name: f"Bearer {api_key}"}
+    return {header_name: api_key}
+
+
+def _http_get(url: str, *, timeout: float, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError("requests is required to probe an HTTP microservice") from exc
+    rec: dict[str, Any] = {
+        "url": url,
+        "attempted": True,
+        "reachable": False,
+        "ok": False,
+        "status_code": None,
+        "detail": "",
+        "payload": None,
+    }
+    try:
+        resp = requests.get(url, headers=headers or None, timeout=timeout)
+    except Exception as exc:
+        rec["detail"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        return rec
+    rec["reachable"] = True
+    rec["status_code"] = int(resp.status_code)
+    body = (resp.text or "")[:400]
+    payload: Any = None
+    try:
+        payload = resp.json()
+        rec["payload"] = payload
+    except ValueError:
+        rec["detail"] = body
+    if resp.status_code >= 400:
+        rec["detail"] = body or f"HTTP {resp.status_code}"
+        return rec
+    rec["ok"] = True
+    if isinstance(payload, dict):
+        status_val = str(payload.get("status") or payload.get("message") or "").strip().lower()
+        code = payload.get("code")
+        if status_val in {"fail", "error", "unhealthy"} or (
+            code not in (None, 0, "0", "ok", "success", True) and "status" in payload
+        ):
+            rec["ok"] = False
+            rec["detail"] = str(payload.get("message") or payload.get("error") or status_val or code)[:240]
+    return rec
+
+
+def probe_http_microservice(cfg: dict | None = None) -> dict[str, Any]:
+    """GET /health (optional) and GET /labels (optional). Never requires an image."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    api_url = str(cfg.get("api_url") or "").strip()
+    result: dict[str, Any] = {
+        "ok": False,
+        "api_url": api_url,
+        "health_url": "",
+        "labels_url": "",
+        "health": {"attempted": False, "ok": False, "reachable": False},
+        "labels": {"attempted": False, "ok": False, "reachable": False, "items": []},
+        "message": "",
+    }
+    if not api_url:
+        result["message"] = "Predict URL is required (e.g. http://host:8080/predict)"
+        return result
+    parsed = urlparse(api_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        result["message"] = "Predict URL must be http(s)://host[:port]/predict"
+        return result
+    try:
+        timeout = float(cfg.get("http_timeout_seconds") or 10)
+    except (TypeError, ValueError):
+        timeout = 10.0
+    timeout = max(3.0, min(15.0, timeout))
+    headers = _probe_auth_headers(cfg)
+    health_url = sibling_endpoint_url(api_url, "health")
+    labels_url = sibling_endpoint_url(api_url, "labels")
+    result["health_url"] = health_url
+    result["labels_url"] = labels_url
+
+    health = _http_get(health_url, timeout=timeout, headers=headers)
+    result["health"] = {
+        "attempted": True,
+        "ok": bool(health.get("ok")),
+        "reachable": bool(health.get("reachable")),
+        "status_code": health.get("status_code"),
+        "url": health_url,
+        "detail": health.get("detail") or "",
+    }
+    labels = _http_get(labels_url, timeout=timeout, headers=headers)
+    items: list[dict[str, Any]] = []
+    labels_parse_error = ""
+    if labels.get("ok") and labels.get("payload") is not None:
+        try:
+            items = parse_labels_payload(labels.get("payload"))
+        except Exception as exc:
+            labels_parse_error = str(exc)[:240]
+    elif labels.get("ok") and labels.get("payload") is None and labels.get("detail"):
+        try:
+            items = parse_labels_payload(json.loads(labels.get("detail") or "[]"))
+        except Exception:
+            pass
+    result["labels"] = {
+        "attempted": True,
+        "ok": bool(labels.get("ok")) and not labels_parse_error,
+        "reachable": bool(labels.get("reachable")),
+        "status_code": labels.get("status_code"),
+        "url": labels_url,
+        "detail": labels_parse_error or (labels.get("detail") or ""),
+        "items": items,
+    }
+
+    host_reachable = bool(health.get("reachable") or labels.get("reachable"))
+    health_missing = (
+        health.get("reachable") and health.get("status_code") in {404, 405, 501}
+    )
+    labels_missing = (
+        labels.get("reachable") and labels.get("status_code") in {404, 405, 501}
+    )
+    if not host_reachable:
+        result["ok"] = False
+        result["message"] = (
+            f"Cannot reach {parsed.netloc}: "
+            f"{health.get('detail') or labels.get('detail') or 'connection failed'}"
+        )
+        return result
+
+    result["ok"] = True
+    bits: list[str] = []
+    if health.get("ok"):
+        bits.append("GET /health ok")
+    elif health_missing:
+        bits.append("GET /health not implemented (optional)")
+    elif health.get("reachable"):
+        bits.append(f"GET /health HTTP {health.get('status_code')}")
+    if items:
+        bits.append(f"GET /labels returned {len(items)} label(s)")
+    elif labels_missing:
+        bits.append("GET /labels not implemented — keep Labels tab as-is")
+    elif labels_parse_error:
+        bits.append(f"GET /labels parse error: {labels_parse_error}")
+    elif labels.get("ok"):
+        bits.append("GET /labels ok but listed no labels")
+    elif labels.get("reachable"):
+        bits.append(f"GET /labels HTTP {labels.get('status_code')}")
+    result["message"] = "; ".join(bits) if bits else "Host reachable"
+    return result
+
+
+def merge_query_into_url(api_url: str, query_fields: dict[str, str] | None = None) -> str:
+    """Keep any existing ``?a=b`` on ``api_url`` and merge extra query fields."""
+    url = (api_url or "").strip()
+    extra = query_fields or {}
+    if not extra:
+        return url
+    parsed = urlparse(url)
+    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    q.update(extra)
+    return urlunparse(parsed._replace(query=urlencode(q)))
+
+
+def infer_http_microservice_from_image_b64(
+    image_b64: str,
+    *,
+    cfg: dict | None = None,
+    threshold: float | None = None,
+) -> list[dict[str, Any]]:
+    cfg = cfg if isinstance(cfg, dict) else {}
+    api_url = str(cfg.get("api_url") or "").strip()
+    if not api_url:
+        raise ValueError(
+            "HTTP microservice detector requires config.api_url "
+            "(e.g. http://192.168.50.42:8080/predict)"
+        )
+    image_bytes = _decode_image_b64(image_b64)
+    if not image_bytes:
+        raise ValueError("HTTP microservice detector received an empty image payload")
+
+    filename, content_type = _guess_image_meta(image_bytes)
+    file_field = str(cfg.get("http_file_field") or DEFAULT_FILE_FIELD).strip() or DEFAULT_FILE_FIELD
+    form_fields = _as_fields(cfg.get("http_form_fields"))
+    query_fields = _as_fields(cfg.get("http_query_fields"))
+    try:
+        timeout = float(cfg.get("http_timeout_seconds") or os.environ.get("HTTP_MS_TIMEOUT") or DEFAULT_TIMEOUT)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_TIMEOUT
+    timeout = max(5.0, min(600.0, timeout))
+
+    url = merge_query_into_url(api_url, query_fields)
+
+    headers: dict[str, str] = {}
+    api_key = str(cfg.get("api_key") or "").strip()
+    if api_key:
+        header_name = str(cfg.get("http_auth_header") or "Authorization").strip() or "Authorization"
+        if header_name.lower() == "authorization" and not api_key.lower().startswith("bearer "):
+            headers[header_name] = f"Bearer {api_key}"
+        else:
+            headers[header_name] = api_key
+
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError("requests is required to call an HTTP microservice") from exc
+
+    files = {file_field: (filename, image_bytes, content_type)}
+    try:
+        resp = requests.post(
+            url,
+            files=files,
+            data=form_fields or None,
+            headers=headers or None,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"HTTP microservice POST {url} failed: {type(exc).__name__}: {str(exc)[:200]}"
+        ) from exc
+
+    if resp.status_code >= 400:
+        body = (resp.text or "")[:240]
+        raise RuntimeError(
+            f"HTTP microservice {url} returned HTTP {resp.status_code}: {body}"
+        )
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        text = (resp.text or "").strip()
+        try:
+            payload = json.loads(text) if text else {}
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(
+                f"HTTP microservice returned non-JSON body: {text[:200]}"
+            ) from exc
+
+    parser_cfg = dict(cfg.get("output_parser_config") or {}) if isinstance(cfg.get("output_parser_config"), dict) else {}
+    if cfg.get("output_format") and "output_format" not in parser_cfg:
+        parser_cfg["output_format"] = cfg.get("output_format")
+    img_w, img_h = 0, 0
+    try:
+        from io import BytesIO
+        from PIL import Image as _PILImage
+        with _PILImage.open(BytesIO(image_bytes)) as im:
+            im.load()
+            img_w, img_h = im.size
+    except Exception:
+        if isinstance(payload, dict):
+            try:
+                img_w = int(payload.get("width") or 0)
+                img_h = int(payload.get("height") or 0)
+            except (TypeError, ValueError):
+                img_w, img_h = 0, 0
+
+    return parse_microservice_json(
+        payload,
+        image_size=(img_w, img_h),
+        parser_config=parser_cfg,
+        threshold=threshold,
+    )

@@ -1,0 +1,416 @@
+"""CLRerNet DLA34 lane detector (ONNX) for CVAT Automatic annotation.
+
+Port of D:\\lane_json_demo\\lane_json_demo\\lane_infer.py (2026-08-19 decode,
+validated against result.json). The ONNX graph is backbone+neck+last refine
+only; preprocess and postprocess MUST stay in this module.
+
+Input:  images [1, 3, 320, 800] float32, BGR/255, crop y=440..1080 of a
+        1920x1080 canvas.
+Output: CVAT lambda detector list:
+        [{label, type=polyline, points=[x1,y1,...], confidence, attributes}]
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import os
+import threading
+from typing import Any
+
+import numpy as np
+
+CUT_HEIGHT = 440
+INPUT_W, INPUT_H = 800, 320
+ORIG_W, ORIG_H = 1920, 1080
+CROP_W, CROP_H = ORIG_W, ORIG_H - CUT_HEIGHT
+
+CONF_THRESHOLD = 0.41
+NMS_DIST_THRESHOLD = 50
+TOPK = 4
+
+NUM_ROWS = 72
+ROW_STEP = CROP_H / 71.0
+
+THETA_DEFAULT = {0: 18, 1: 22, 2: 25, 3: 27, 4: 30, 5: 32}
+NUM_TID = len(THETA_DEFAULT)
+ANCHORS_PER_TID = 192 // NUM_TID
+
+DEFAULT_ONNX_NAME = "clrernet_dla34_320x800_20260813-sim.onnx"
+DEFAULT_ONNX_PATHS = (
+    os.environ.get("CLRERNET_ONNX_PATH", "").strip(),
+    f"/opt/cvat/models/{DEFAULT_ONNX_NAME}",
+    f"/home/django/models/{DEFAULT_ONNX_NAME}",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", DEFAULT_ONNX_NAME),
+)
+
+LANE_LABEL = "lane"
+POSITION_VALUES = ("left-lane", "left-left-lane", "right-lane", "right-right-lane")
+
+_SESSION_LOCK = threading.Lock()
+_SESSION = None
+_SESSION_PATH: str | None = None
+
+
+def cfg_is_clrernet_lane(cfg: dict | None) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    model = str(cfg.get("model") or "").strip().lower()
+    exec_mode = str(cfg.get("execution_mode") or "").strip().lower()
+    backend = str(
+        cfg.get("local_backend") or cfg.get("vision_backend") or ""
+    ).strip().lower()
+    # Generic HTTP microservice uses the same vision_pipeline slot; do not steal it.
+    if backend in {"http", "http_microservice", "http_detector", "http_post", "generic_http"}:
+        return False
+    if model.startswith("http_") or model in {"http_detector", "http_microservice", "generic_http"}:
+        return False
+    if cfg.get("http_form_fields") or cfg.get("http_file_field"):
+        return False
+    if "clrernet" in model or backend in ("clrernet", "clrernet_lane"):
+        return True
+    if exec_mode == "vision_pipeline" and ("lane" in model or "clrernet" in model):
+        return True
+    return False
+
+
+def resolve_onnx_path(explicit: str | None = None) -> str:
+    candidates = []
+    if explicit and str(explicit).strip():
+        candidates.append(str(explicit).strip())
+    candidates.extend([p for p in DEFAULT_ONNX_PATHS if p])
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    searched = " ; ".join(candidates) if candidates else "(none)"
+    raise FileNotFoundError(
+        "CLRerNet ONNX not found. Set CLRERNET_ONNX_PATH or place "
+        f"{DEFAULT_ONNX_NAME} under /opt/cvat/models/. Searched: {searched}"
+    )
+
+
+def _get_session(onnx_path: str):
+    global _SESSION, _SESSION_PATH
+    with _SESSION_LOCK:
+        if _SESSION is not None and _SESSION_PATH == onnx_path:
+            return _SESSION
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError(
+                "onnxruntime is not installed in this CVAT container. "
+                "pip install onnxruntime (CPU) then restart cvat_server / "
+                "cvat_worker_annotation."
+            ) from exc
+        providers = ["CPUExecutionProvider"]
+        try:
+            available = list(ort.get_available_providers() or [])
+            if "CUDAExecutionProvider" in available:
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        except Exception:
+            pass
+        _SESSION = ort.InferenceSession(onnx_path, providers=providers)
+        _SESSION_PATH = onnx_path
+        return _SESSION
+
+
+def softmax(x, axis=-1):
+    x_max = np.max(x, axis=axis, keepdims=True)
+    e_x = np.exp(x - x_max)
+    return e_x / np.sum(e_x, axis=axis, keepdims=True)
+
+
+def _bgr_from_payload_image(image_b64: str) -> np.ndarray:
+    raw = base64.b64decode(image_b64)
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("opencv-python-headless is required for CLRerNet") from exc
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is not None:
+        return img
+    from PIL import Image as PILImage
+    with PILImage.open(io.BytesIO(raw)) as pimg:
+        pimg.load()
+        rgb = np.array(pimg.convert("RGB"))
+    return rgb[:, :, ::-1].copy()
+
+
+def preprocess_bgr(img: np.ndarray):
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("opencv-python-headless is required for CLRerNet") from exc
+    orig_h, orig_w = int(img.shape[0]), int(img.shape[1])
+    work = img
+    if (orig_h, orig_w) != (ORIG_H, ORIG_W):
+        work = cv2.resize(img, (ORIG_W, ORIG_H), interpolation=cv2.INTER_LINEAR)
+    cropped = work[CUT_HEIGHT:ORIG_H, 0:ORIG_W, :].copy()
+    resized = cv2.resize(cropped, (INPUT_W, INPUT_H), interpolation=cv2.INTER_LINEAR)
+    tensor = resized.astype(np.float32) / 255.0
+    tensor = np.transpose(tensor, (2, 0, 1))
+    tensor = np.ascontiguousarray(np.expand_dims(tensor, axis=0))
+    return work, tensor, orig_w, orig_h
+
+
+def decode_lanes(cls_logits, anchor_params, lengths, xs, conf_threshold: float):
+    cls_probs = softmax(cls_logits[0], axis=-1)
+    fg_scores = cls_probs[:, 1]
+    valid_mask = fg_scores >= conf_threshold
+    valid_indices = np.where(valid_mask)[0]
+
+    if len(valid_indices) == 0:
+        return []
+
+    xs_all = xs[0]
+    lengths_all = lengths[0, :, 0]
+
+    candidates = []
+    for idx in valid_indices:
+        fg = float(fg_scores[idx])
+        tid = idx // ANCHORS_PER_TID
+        start_row = THETA_DEFAULT.get(tid, 24)
+        length_71 = int(round(float(lengths_all[idx]) * 71.0))
+        length_71 = max(2, min(length_71, NUM_ROWS - start_row))
+        end_row = start_row + length_71 - 1
+        if end_row >= NUM_ROWS:
+            end_row = NUM_ROWS - 1
+            length_71 = end_row - start_row + 1
+        if length_71 < 2:
+            continue
+
+        xs_row = xs_all[idx]
+        points = []
+        valid_x = 0
+        sum_x = 0.0
+        consecutive_bad = 0
+        consecutive_edge = 0
+        prev_x_norm = None
+        last_slopes = []
+        recent_x_norms = []
+        mid_slope = None
+        mid_slope_ready = False
+
+        for row in range(start_row, end_row + 1):
+            xs_val = float(xs_row[row])
+            if np.isnan(xs_val) or np.isinf(xs_val):
+                consecutive_bad += 1
+                if consecutive_bad >= 3:
+                    break
+                continue
+            x_norm = max(0.0, min(1.0, xs_val))
+            x_full = x_norm * ORIG_W
+            y_full = float(ORIG_H) - float(row) * ROW_STEP
+            if not (CUT_HEIGHT - 10 <= y_full <= ORIG_H + 10):
+                consecutive_bad += 1
+                if consecutive_bad >= 3:
+                    break
+                continue
+
+            dy = -ROW_STEP
+            if prev_x_norm is not None:
+                dx_n = x_norm - prev_x_norm
+                slope = dx_n / (dy / ORIG_H)
+                last_slopes.append(slope)
+                if len(last_slopes) > 15:
+                    last_slopes.pop(0)
+            prev_x_norm = x_norm
+
+            recent_x_norms.append(x_norm)
+            if len(recent_x_norms) > 15:
+                recent_x_norms.pop(0)
+
+            if not mid_slope_ready and len(last_slopes) >= 6:
+                ss = sorted(last_slopes)
+                mid_slope = ss[len(ss) // 2]
+                if abs(mid_slope) < 0.05:
+                    mid_slope = 0.05 if mid_slope >= 0 else -0.05
+                mid_slope_ready = True
+
+            if mid_slope_ready and len(last_slopes) >= 3 and len(points) >= 5:
+                recent3 = last_slopes[-3:]
+                mean_r3 = sum(recent3) / len(recent3)
+                deviations = [
+                    abs(sl - sum(last_slopes[-6:-3]) / 3)
+                    if len(last_slopes) >= 6
+                    else abs(sl - mid_slope)
+                    for sl in last_slopes[-6:]
+                ]
+                mad = sorted(deviations)[len(deviations) // 2] if deviations else 0.0
+                thresh = max(0.25, 3.0 * (mad if mad > 0 else abs(mid_slope) * 0.6))
+                if abs(mean_r3 - mid_slope) > thresh:
+                    break
+
+                if mid_slope_ready and len(last_slopes) >= 3:
+                    s1, s2 = last_slopes[-2], last_slopes[-1]
+                    if mid_slope * s1 < -abs(mid_slope) * 0.3 and mid_slope * s2 < -abs(mid_slope) * 0.3:
+                        break
+
+            if x_norm <= 0.003 or x_norm >= 0.997:
+                first_had_edge = any(
+                    0.01 <= xn <= 0.99 for xn in recent_x_norms[:7] if len(recent_x_norms) >= 7
+                )
+                if first_had_edge or len(points) >= 8:
+                    consecutive_edge += 1
+                if consecutive_edge >= 3:
+                    break
+            else:
+                consecutive_edge = 0
+
+            x_r = round(x_full * 100) / 100
+            y_r = round(y_full * 100) / 100
+            points.append((x_r, y_r))
+            consecutive_bad = 0
+            if 0 <= x_full <= ORIG_W:
+                valid_x += 1
+                sum_x += x_full
+
+        if len(points) < 2:
+            continue
+        if valid_x >= 2:
+            avg_x = sum_x / valid_x
+        else:
+            avg_x = sum(p[0] for p in points) / len(points)
+
+        edge_count = 0
+        for (x_pt, _) in points:
+            if x_pt <= 1.0 or x_pt >= ORIG_W - 1.0:
+                edge_count += 1
+        if edge_count >= len(points) * 0.8 and len(points) >= 2:
+            continue
+
+        candidates.append({
+            "idx": int(idx),
+            "score": fg,
+            "points": points,
+            "avg_x": avg_x,
+            "length": len(points),
+        })
+
+    if len(candidates) == 0:
+        return []
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    kept = []
+    for cand in candidates:
+        if len(kept) >= TOPK:
+            break
+        ok = True
+        for k in kept:
+            dist = abs(cand["avg_x"] - k["avg_x"])
+            if dist <= NMS_DIST_THRESHOLD:
+                ok = False
+                break
+        if ok:
+            kept.append(cand)
+
+    kept.sort(key=lambda c: c["points"][0][0])
+    return kept
+
+
+def assign_positions(lanes):
+    if len(lanes) == 0:
+        return lanes
+    center_x = ORIG_W / 2.0
+    with_pos = []
+    for lane in lanes:
+        bot_pt = lane["points"][0]
+        with_pos.append((bot_pt[0], lane))
+    with_pos.sort(key=lambda x: x[0])
+    left = [(x, l) for x, l in with_pos if x < center_x]
+    right = [(x, l) for x, l in with_pos if x >= center_x]
+    left.sort(key=lambda x: abs(x[0] - center_x))
+    right.sort(key=lambda x: abs(x[0] - center_x))
+    result = {}
+    for i, (_, lane) in enumerate(left):
+        result[id(lane)] = "left-lane" if i == 0 else "left-left-lane"
+    for i, (_, lane) in enumerate(right):
+        result[id(lane)] = "right-lane" if i == 0 else "right-right-lane"
+    for lane in lanes:
+        lane["position"] = result.get(id(lane), "left-lane")
+    return lanes
+
+
+def clip_far_tail_same_side(lanes, *, center_x: float = ORIG_W / 2.0, margin: float = 80.0):
+    """Drop far points that cross into the opposite image half.
+
+    Near-end xs is usually reliable. When a lead vehicle occludes the
+    vanishing region, far-row xs often keep the same slope and walk across
+    the midline through the car. Slope-MAD breaks miss this (smooth fly).
+    Do not change the x/y formula; only shorten the polyline.
+    """
+    for lane in lanes:
+        pts = lane.get("points") or []
+        if len(pts) < 3:
+            continue
+        start_x = float(pts[0][0])
+        side = -1 if start_x < center_x else 1
+        kept = [pts[0]]
+        for pt in pts[1:]:
+            x = float(pt[0])
+            if side < 0 and x > center_x + margin:
+                break
+            if side > 0 and x < center_x - margin:
+                break
+            kept.append(pt)
+        if len(kept) >= 2:
+            lane["points"] = kept
+    return lanes
+
+
+def _scale_points(points, orig_w: int, orig_h: int):
+    if orig_w == ORIG_W and orig_h == ORIG_H:
+        return points
+    sx = float(orig_w) / float(ORIG_W)
+    sy = float(orig_h) / float(ORIG_H)
+    return [(round(x * sx, 2), round(y * sy, 2)) for (x, y) in points]
+
+
+def lanes_to_lambda_items(lanes, orig_w: int, orig_h: int, label: str = LANE_LABEL) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for lane in lanes:
+        scaled = _scale_points(lane["points"], orig_w, orig_h)
+        flat: list[float] = []
+        for (x, y) in scaled:
+            flat.append(round(float(x), 2))
+            flat.append(round(float(y), 2))
+        pos = str(lane.get("position") or "left-lane")
+        if pos not in POSITION_VALUES:
+            pos = "left-lane"
+        out.append({
+            "label": label,
+            "type": "polyline",
+            "points": flat,
+            "confidence": str(round(float(lane.get("score") or 0.0), 4)),
+            "attributes": [
+                {"name": "position", "value": pos},
+                {"name": "Occlusion", "value": "0"},
+            ],
+        })
+    return out
+
+
+def infer_lanes_from_image_b64(
+    image_b64: str,
+    *,
+    onnx_path: str | None = None,
+    threshold: float | None = None,
+    label: str = LANE_LABEL,
+) -> list[dict[str, Any]]:
+    if not image_b64:
+        return []
+    path = resolve_onnx_path(onnx_path)
+    sess = _get_session(path)
+    img = _bgr_from_payload_image(image_b64)
+    _work, tensor, orig_w, orig_h = preprocess_bgr(img)
+    outputs = sess.run(None, {"images": tensor})
+    cls, _ap, ln, xs = outputs[0], outputs[1], outputs[2], outputs[3]
+    if isinstance(threshold, (int, float)) and 0.01 <= float(threshold) <= 0.99:
+        conf = float(threshold)
+    else:
+        conf = CONF_THRESHOLD
+    lanes = decode_lanes(cls, _ap, ln, xs, conf)
+    lanes = assign_positions(lanes)
+    lanes = clip_far_tail_same_side(lanes)
+    return lanes_to_lambda_items(lanes, orig_w, orig_h, label=label)

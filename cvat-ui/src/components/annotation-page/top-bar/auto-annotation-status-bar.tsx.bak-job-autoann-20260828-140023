@@ -1,0 +1,39 @@
+// Copyright (C) CVAT.ai Corporation
+//
+// SPDX-License-Identifier: MIT
+
+import React, { useEffect } from 'react';
+import { useDispatch, useSelector } from 'react-redux';
+import { CombinedState } from 'reducers';
+import { Job } from 'cvat-core-wrapper';
+import { cancelInferenceAsync, getInferenceStatusAsync } from 'actions/models-actions';
+import AutomaticAnnotationProgress from 'components/tasks-page/automatic-annotation-progress';
+
+export default function AutoAnnotationStatusBar(): JSX.Element | null {
+    const dispatch = useDispatch();
+    const jobInstance = useSelector((state: CombinedState) => state.annotation.job.instance as Job | null);
+    const inferences = useSelector((state: CombinedState) => state.models.inferences);
+    const taskId = jobInstance?.taskId ?? null;
+    const activeInference = taskId !== null ? inferences[taskId] ?? null : null;
+
+    useEffect(() => {
+        dispatch(getInferenceStatusAsync());
+    }, [dispatch]);
+
+    if (!activeInference) {
+        return null;
+    }
+
+    return (
+        <div className='cvat-annotation-auto-ann-progress'>
+            <AutomaticAnnotationProgress
+                activeInference={activeInference}
+                cancelAutoAnnotation={() => {
+                    if (taskId !== null) {
+                        dispatch(cancelInferenceAsync(taskId));
+                    }
+                }}
+            />
+        </div>
+    );
+}

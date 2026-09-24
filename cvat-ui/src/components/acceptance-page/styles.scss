@@ -1,0 +1,599 @@
+.cvat-acceptance-page {
+    .cvat-acceptance-top-bar {
+        padding: 16px 24px;
+        background: #fff;
+        border-bottom: 1px solid #f0f0f0;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+
+        .cvat-acceptance-page-title {
+            font-size: 20px;
+            font-weight: 600;
+            color: #1f2937;
+            margin: 0;
+        }
+
+        .cvat-acceptance-page-count {
+            display: block;
+            margin-top: 2px;
+            font-size: 13px;
+        }
+
+        .cvat-acceptance-top-bar-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+    }
+
+    .cvat-acceptance-content-wrapper {
+        padding: 16px 24px 24px;
+    }
+
+    .cvat-acceptance-layout {
+        display: grid;
+        grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+        gap: 16px;
+        align-items: start;
+        min-height: calc(100vh - 180px);
+    }
+
+    .cvat-acceptance-layout__nav {
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        padding: 12px;
+        min-height: 420px;
+    }
+
+    .cvat-acceptance-layout__detail {
+        position: sticky;
+        top: 16px;
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        min-height: 420px;
+        overflow: hidden;
+    }
+
+    .cvat-acceptance-layout__pager {
+        margin-top: 16px;
+        display: flex;
+        justify-content: center;
+    }
+
+    .cvat-acceptance-empty {
+        text-align: center;
+        padding: 48px 24px 24px;
+        color: #6b7280;
+    }
+
+    .cvat-acceptance-task-group {
+        margin-bottom: 12px;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        overflow: hidden;
+        background: #fff;
+
+        &:last-child {
+            margin-bottom: 0;
+        }
+
+        .cvat-acceptance-task-group__header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 12px;
+            background: #f8fafc;
+            border-bottom: 1px solid #e5e7eb;
+            cursor: pointer;
+            user-select: none;
+
+            .cvat-acceptance-task-group__title {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                font-weight: 600;
+                color: #111827;
+            }
+
+            .cvat-acceptance-task-group__chevron {
+                font-size: 11px;
+                color: #6b7280;
+            }
+
+            .cvat-acceptance-task-group__meta {
+                color: #6b7280;
+                font-size: 13px;
+            }
+
+            .cvat-acceptance-task-group__id {
+                color: #94a3b8;
+                font-weight: 500;
+                margin-left: 4px;
+            }
+        }
+    }
+
+    .cvat-acceptance-session-list {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .cvat-acceptance-session-row {
+        display: block;
+        width: 100%;
+        text-align: left;
+        border: none;
+        border-bottom: 1px solid #f1f5f9;
+        background: transparent;
+        padding: 10px 12px;
+        cursor: pointer;
+
+        &:last-child {
+            border-bottom: none;
+        }
+
+        &:hover {
+            background: #f8fafc;
+        }
+
+        &.is-selected {
+            background: #eff6ff;
+            box-shadow: inset 3px 0 0 #2563eb;
+        }
+
+        .cvat-acceptance-session-row__main {
+            min-width: 0;
+        }
+
+        .cvat-acceptance-session-row__title {
+            margin-bottom: 2px;
+        }
+
+        .cvat-acceptance-session-row__id {
+            font-weight: 600;
+            font-size: 14px;
+            color: #1d4ed8;
+            line-height: 1.3;
+        }
+
+        .cvat-acceptance-session-row__summary {
+            color: #0f172a;
+            font-size: 13px;
+            line-height: 1.45;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 100%;
+        }
+
+        .cvat-acceptance-session-row__meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px 12px;
+            margin-top: 4px;
+            font-size: 12px;
+            color: #64748b;
+        }
+    }
+
+    @media (max-width: 1100px) {
+        .cvat-acceptance-layout {
+            grid-template-columns: 1fr;
+        }
+
+        .cvat-acceptance-layout__detail {
+            position: static;
+        }
+    }
+}
+
+.cvat-acceptance-review-panel {
+    padding: 16px 18px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 420px;
+
+    &--empty {
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        color: #64748b;
+        padding: 48px 24px;
+    }
+
+    .cvat-acceptance-review-panel__header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+    }
+
+    .cvat-acceptance-review-panel__title {
+        margin: 0 !important;
+        color: #111827;
+    }
+
+    .cvat-acceptance-review-panel__headline {
+        display: block;
+        margin-top: 4px;
+        font-size: 13px;
+    }
+
+    .cvat-acceptance-review-panel__meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 14px;
+        font-size: 12px;
+        color: #64748b;
+    }
+
+    .cvat-acceptance-review-panel__stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .cvat-acceptance-review-panel__section-label {
+        display: block;
+        font-size: 12px;
+        margin-bottom: 6px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+
+    .cvat-acceptance-review-panel__actions {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 4px;
+    }
+
+    .cvat-acceptance-review-panel__tip {
+        font-size: 12px;
+        line-height: 1.4;
+    }
+
+    .cvat-acceptance-review-panel__raw {
+        margin-top: 4px;
+        border-top: 1px solid #f1f5f9;
+        padding-top: 4px;
+    }
+
+    .cvat-acceptance-review-empty-diff {
+        font-size: 13px;
+    }
+}
+
+.cvat-acceptance-frame-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.cvat-acceptance-frame-chip {
+    border: 1px solid #e2e8f0;
+    background: #f8fafc;
+    color: #334155;
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    line-height: 18px;
+
+    &:hover {
+        border-color: #93c5fd;
+        color: #1d4ed8;
+    }
+
+    &.is-active {
+        background: #dbeafe;
+        border-color: #60a5fa;
+        color: #1e40af;
+        font-weight: 600;
+    }
+}
+
+.cvat-acceptance-diff-list {
+    max-height: 280px;
+    overflow-y: auto;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+}
+
+.cvat-acceptance-diff-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 10px;
+    border-bottom: 1px solid #f1f5f9;
+    font-size: 13px;
+
+    &:last-child {
+        border-bottom: none;
+    }
+
+    .cvat-acceptance-diff-item__body {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+
+    .cvat-acceptance-diff-item__label {
+        font-weight: 600;
+        color: #0f172a;
+    }
+
+    .cvat-acceptance-diff-item__summary {
+        color: #64748b;
+        font-size: 12px;
+    }
+
+    .cvat-acceptance-diff-item__frame {
+        color: #94a3b8;
+        font-size: 12px;
+        font-family: Consolas, Monaco, monospace;
+        flex-shrink: 0;
+    }
+}
+
+/* Dim native annotations while comparing to original overlay */
+.cvat-annotation-page.cvat-acceptance-comparing-original {
+    #cvat_canvas_content > *:not(#cvat-acceptance-before-layer) {
+        opacity: 0.32;
+    }
+
+    #cvat-acceptance-before-layer {
+        opacity: 1 !important;
+    }
+}
+
+.cvat-acceptance-session-bar {
+    position: fixed;
+    z-index: 1100;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    width: max-content;
+    max-width: calc(100vw - 16px);
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(15, 23, 42, 0.18);
+    border: 1px solid #dbe3f0;
+    background: #ffffff;
+    padding: 8px 10px;
+    pointer-events: auto;
+    user-select: none;
+
+    &.create {
+        border-color: #93c5fd;
+        background: linear-gradient(180deg, #eff6ff 0%, #ffffff 48%);
+    }
+
+    &.review {
+        border-color: #fcd34d;
+        background: linear-gradient(180deg, #fffbeb 0%, #ffffff 48%);
+    }
+
+    &.is-dragging {
+        opacity: 0.92;
+        box-shadow: 0 12px 28px rgba(15, 23, 42, 0.28);
+        cursor: grabbing;
+    }
+
+    .cvat-acceptance-session-bar__drag {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 28px;
+        height: 28px;
+        border: none;
+        border-radius: 6px;
+        background: transparent;
+        color: #64748b;
+        cursor: grab;
+        padding: 0;
+        flex: 0 0 auto;
+
+        &:hover {
+            background: rgba(15, 23, 42, 0.06);
+            color: #334155;
+        }
+
+        &:active {
+            cursor: grabbing;
+        }
+    }
+}
+
+/* Keep header Correct button the same size as Undo/Save */
+.cvat-annotation-header {
+    .cvat-acceptance-header-button.cvat-annotation-header-button {
+        color: #2563eb;
+
+        &.cvat-button-active {
+            color: #1d4ed8;
+            background-color: rgba(37, 99, 235, 0.08);
+            border-radius: 6px;
+        }
+    }
+}
+
+.cvat-acceptance-json-block {
+    max-height: 360px;
+    overflow: auto;
+    background: #f8fafc;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 8px;
+    font-size: 11px;
+    font-family: Consolas, Monaco, monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.cvat-acceptance-compare-drawer {
+    .ant-drawer-body {
+        padding-top: 12px;
+    }
+}
+
+.cvat-acceptance-create-modal {
+    .cvat-acceptance-form-item {
+        margin-bottom: 16px;
+
+        label {
+            display: block;
+            font-weight: 500;
+            color: #374151;
+            margin-bottom: 6px;
+            font-size: 14px;
+        }
+    }
+
+    .cvat-acceptance-snapshot-preview {
+        border: 1px solid #e5e7eb;
+        border-radius: 6px;
+        padding: 12px;
+        background: #f9fafb;
+        max-height: 200px;
+        overflow-y: auto;
+        font-family: monospace;
+        font-size: 12px;
+        color: #374151;
+    }
+
+    .cvat-acceptance-count-changes {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin-top: 12px;
+
+        .cvat-acceptance-count-item {
+            padding: 12px;
+            border-radius: 6px;
+            background: #f3f4f6;
+
+            .cvat-acceptance-count-label {
+                font-size: 12px;
+                color: #6b7280;
+            }
+
+            .cvat-acceptance-count-value {
+                font-size: 16px;
+                font-weight: 600;
+                color: #111827;
+                margin-top: 4px;
+
+                .count-increase {
+                    color: #059669;
+                }
+
+                .count-decrease {
+                    color: #dc2626;
+                }
+            }
+        }
+    }
+}
+
+.cvat-acceptance-compare-drawer {
+    .cvat-acceptance-compare-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 16px 24px;
+        border-bottom: 1px solid #f0f0f0;
+
+        .cvat-acceptance-compare-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #1f2937;
+        }
+    }
+
+    .cvat-acceptance-compare-content {
+        padding: 24px;
+
+        .cvat-acceptance-compare-tabs {
+            margin-bottom: 16px;
+        }
+
+        .cvat-acceptance-snapshot-section {
+            margin-bottom: 24px;
+
+            .cvat-acceptance-snapshot-label {
+                font-size: 14px;
+                font-weight: 600;
+                color: #374151;
+                margin-bottom: 12px;
+                padding: 8px 12px;
+                border-radius: 6px;
+
+                &.before {
+                    background: #fef3c7;
+                    color: #92400e;
+                }
+
+                &.after {
+                    background: #d1fae5;
+                    color: #065f46;
+                }
+            }
+
+            .cvat-acceptance-snapshot-data {
+                border: 1px solid #e5e7eb;
+                border-radius: 6px;
+                padding: 16px;
+                background: #fff;
+                max-height: 400px;
+                overflow-y: auto;
+                font-family: 'Courier New', monospace;
+                font-size: 12px;
+                line-height: 1.6;
+                color: #374151;
+            }
+        }
+
+        .cvat-acceptance-compare-meta {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 16px;
+            margin-bottom: 24px;
+
+            .cvat-acceptance-meta-item {
+                padding: 12px;
+                border: 1px solid #e5e7eb;
+                border-radius: 6px;
+                background: #f9fafb;
+
+                .cvat-acceptance-meta-label {
+                    font-size: 12px;
+                    color: #6b7280;
+                }
+
+                .cvat-acceptance-meta-value {
+                    font-size: 14px;
+                    color: #111827;
+                    margin-top: 4px;
+                    font-weight: 500;
+                }
+            }
+        }
+    }
+}
+
+.cvat-acceptance-annotation-toolbar-btn {
+    background: #2563eb !important;
+    color: #fff !important;
+    border-color: #2563eb !important;
+
+    &:hover {
+        background: #1d4ed8 !important;
+        border-color: #1d4ed8 !important;
+    }
+}

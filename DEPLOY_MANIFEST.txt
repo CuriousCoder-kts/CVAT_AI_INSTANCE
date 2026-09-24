@@ -1,0 +1,29 @@
+CVAT Deployment Package
+=======================
+Packaged at      : 20260811-173818
+Packaged from    : D:\cvat-develop
+Package mode     : git-whitelist
+Files in package : 2925
+Packager script  : pack-deploy.ps1
+Deploy script    : deploy-cvat.sh
+Checklist doc    : DEPLOY_CHECKLIST.md
+
+Key customizations included:
+  - BailianSettings DB model + migration (organizations/0003_bailiansettings.py)
+  - lambda_manager: bailian-config auto-inject + nuclio container-DNS fallback
+    (cvat/apps/lambda_manager/views.py)
+  - cvat-core: BailianSettings SDK class + serverProxy organizations.bailianSettings
+    (cvat-core/src/organization.ts, cvat-core/src/server-proxy.ts)
+  - cvat-ui: /organization/bailian page + Organization menu entry
+    (cvat-ui/src/components/organization-bailian-page/*, cvat-app.tsx, header.tsx)
+  - Nuclio function: serverless/qwen/bailian/qwen37-detector/ (9 traffic classes,
+    function.yaml + main.py with prompt-engineering + JSON repair + NMS)
+  - Deployment templates: .env.example + docker-compose.override.yml.example
+
+Server-side deployment (quick steps):
+  1. tar -xzf cvat-deploy-*.tar.gz -C ~/cvat-develop
+  2. cd ~/cvat-develop
+  3. cp .env.example .env  &&  nano .env    (set CVAT_HOST + proxy/no_proxy if needed)
+  4. sudo bash deploy-cvat.sh
+  5. Open http://CVAT_HOST:8080  ->  Organization -> Bailian settings
+     -> fill API Key / URL / Model -> Save

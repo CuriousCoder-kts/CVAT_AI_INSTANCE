@@ -1,0 +1,590 @@
+"""HTTP /track adapter + local OpenCV DIS optical-flow fallback.
+
+Official Magic Wand Trackers call LambdaFunction.invoke with
+``{image, shapes, states}`` → ``{shapes, states}``. This module converts that
+to a colleague ``POST /track`` (multipart, same product pattern as
+``http_microservice.py`` ``POST /predict``), or runs in-process
+``cv2.DISOpticalFlow`` when ``api_url`` is empty.
+
+Marker strings (grep in live Python): ``local-optical-flow-dis``, ``object_tracker``.
+
+State is compact (prev gray JPEG of a padded crop + origin + box). Never store
+a full 1080p frame in the signed tracker state.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+from typing import Any
+
+from cvat.apps.lambda_manager.http_microservice import (
+    DEFAULT_FILE_FIELD,
+    DEFAULT_TIMEOUT,
+    _as_fields,
+    _decode_image_b64,
+    _guess_image_meta,
+    merge_query_into_url,
+)
+
+LOCAL_OF_FUNCTION_ID = "local-optical-flow-dis"
+LOCAL_OF_DISPLAY_NAME = "Optical Flow (DIS)"
+
+HTTP_TRACKER_BACKENDS = frozenset({
+    "http_tracker",
+    "http_microservice_tracker",
+    "optical_flow",
+    "optical_flow_dis",
+    "dis",
+})
+HTTP_TRACKER_MODELS = frozenset({
+    "http_tracker",
+    "http_microservice_tracker",
+    "optical_flow",
+    "optical_flow_dis",
+    "dis_optical_flow",
+    LOCAL_OF_FUNCTION_ID,
+})
+
+_MIN_BOX_PX = 4.0
+_LOST_SCORE = 0.22
+_AREA_RATIO_MIN = 0.12
+_AREA_RATIO_MAX = 10.0
+_MAX_CROP_SIDE = 384
+_JPEG_QUALITY = 70
+_PAD_MIN = 32
+_PAD_MAX = 160
+
+
+def is_optical_flow_tracker_id(func_id: Any) -> bool:
+    return str(func_id or "").strip() == LOCAL_OF_FUNCTION_ID
+
+
+def cfg_is_http_tracker(cfg: dict | None) -> bool:
+    if not isinstance(cfg, dict):
+        return False
+    backend = str(
+        cfg.get("local_backend") or cfg.get("vision_backend") or ""
+    ).strip().lower()
+    model = str(cfg.get("model") or "").strip().lower()
+    api_url = str(cfg.get("api_url") or "").strip().lower()
+    if backend in HTTP_TRACKER_BACKENDS:
+        return True
+    if model in HTTP_TRACKER_MODELS or model.startswith("http_tracker"):
+        return True
+    if "optical_flow" in model or "optical-flow" in model:
+        return True
+    if "/track" in api_url:
+        return True
+    return False
+
+
+def lambda_type_for_feature_kind(feature_kind: Any) -> str:
+    kind = str(feature_kind or "").strip().lower()
+    if kind == "object_tracker":
+        return "tracker"
+    return "detector"
+
+
+def local_optical_flow_lambda_data() -> dict[str, Any]:
+    """Dummy Nuclio-shaped metadata so list/get never hit Nuclio."""
+    spec = [{"name": "object", "type": "rectangle", "attributes": []}]
+    return {
+        "metadata": {
+            "name": LOCAL_OF_FUNCTION_ID,
+            "namespace": "cvat",
+            "annotations": {
+                "name": LOCAL_OF_DISPLAY_NAME,
+                "type": "tracker",
+                "supported_shape_types": "rectangle",
+                "spec": json.dumps(spec, ensure_ascii=False),
+                "version": "1",
+                "help_message": (
+                    "Optical Flow (DIS) is disabled. Use Automatic annotation with a "
+                    "detector that returns the same object id on every frame."
+                ),
+            },
+        },
+        "spec": {
+            "description": (
+                "Always-on local DIS optical-flow tracker. Empty api_url = in-process "
+                "cv2.DISOpticalFlow. Marker: local-optical-flow-dis object_tracker."
+            ),
+        },
+        "status": {"httpPort": None, "state": "ready"},
+    }
+
+
+def _parse_box(shape: Any, fallback: list[float] | None = None) -> list[float] | None:
+    pts: Any = None
+    if shape is None:
+        return list(fallback) if fallback else None
+    if isinstance(shape, dict):
+        pts = shape.get("points")
+        if pts is None:
+            for key in ("box", "bbox"):
+                if shape.get(key) is not None:
+                    pts = shape.get(key)
+                    break
+    elif isinstance(shape, (list, tuple)):
+        if not shape:
+            return list(fallback) if fallback else None
+        first = shape[0]
+        if isinstance(first, (int, float)):
+            pts = shape
+        elif isinstance(first, dict):
+            return _parse_box(first, fallback)
+    if not isinstance(pts, (list, tuple)) or len(pts) < 4:
+        return list(fallback) if fallback else None
+    try:
+        xtl, ytl, xbr, ybr = float(pts[0]), float(pts[1]), float(pts[2]), float(pts[3])
+    except (TypeError, ValueError):
+        return list(fallback) if fallback else None
+    if xbr < xtl:
+        xtl, xbr = xbr, xtl
+    if ybr < ytl:
+        ytl, ybr = ybr, ytl
+    return [xtl, ytl, xbr, ybr]
+
+
+def _clip_box(box: list[float], width: int, height: int) -> list[float] | None:
+    xtl = max(0.0, min(float(width), box[0]))
+    ytl = max(0.0, min(float(height), box[1]))
+    xbr = max(0.0, min(float(width), box[2]))
+    ybr = max(0.0, min(float(height), box[3]))
+    if xbr < xtl:
+        xtl, xbr = xbr, xtl
+    if ybr < ytl:
+        ytl, ybr = ybr, ytl
+    if (xbr - xtl) < _MIN_BOX_PX or (ybr - ytl) < _MIN_BOX_PX:
+        return None
+    return [xtl, ytl, xbr, ybr]
+
+
+def _box_lost(box: list[float] | None, prev: list[float] | None, width: int, height: int, score: float) -> bool:
+    if box is None:
+        return True
+    w = box[2] - box[0]
+    h = box[3] - box[1]
+    if w < _MIN_BOX_PX or h < _MIN_BOX_PX:
+        return True
+    cx = 0.5 * (box[0] + box[2])
+    cy = 0.5 * (box[1] + box[3])
+    if cx < 0 or cy < 0 or cx > width or cy > height:
+        return True
+    inter_w = max(0.0, min(box[2], float(width)) - max(box[0], 0.0))
+    inter_h = max(0.0, min(box[3], float(height)) - max(box[1], 0.0))
+    if inter_w * inter_h <= 0:
+        return True
+    if prev is not None:
+        pw = max(prev[2] - prev[0], 1e-3)
+        ph = max(prev[3] - prev[1], 1e-3)
+        ratio = (w * h) / (pw * ph)
+        if ratio < _AREA_RATIO_MIN or ratio > _AREA_RATIO_MAX:
+            return True
+    if score < _LOST_SCORE:
+        return True
+    return False
+
+
+def _decode_bgr(image_b64: str):
+    import cv2
+    import numpy as np
+
+    raw = _decode_image_b64(image_b64)
+    if not raw:
+        raise ValueError("optical-flow tracker received an empty image payload")
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None or bgr.size == 0:
+        raise ValueError("optical-flow tracker could not decode the frame image")
+    return bgr
+
+
+def _pad_for_box(box: list[float]) -> int:
+    bw = max(box[2] - box[0], 1.0)
+    bh = max(box[3] - box[1], 1.0)
+    pad = int(round(0.5 * max(bw, bh)))
+    return max(_PAD_MIN, min(_PAD_MAX, pad))
+
+
+def _crop_gray_roi(gray, box: list[float], pad: int | None = None):
+    import numpy as np
+
+    h, w = gray.shape[:2]
+    if pad is None:
+        pad = _pad_for_box(box)
+    x0 = max(0, int(box[0]) - pad)
+    y0 = max(0, int(box[1]) - pad)
+    x1 = min(w, int(round(box[2])) + pad)
+    y1 = min(h, int(round(box[3])) + pad)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        x0, y0, x1, y1 = 0, 0, w, h
+    crop = np.ascontiguousarray(gray[y0:y1, x0:x1])
+    # Downscale long side so signed state JPEG stays small.
+    ch, cw = crop.shape[:2]
+    scale = 1.0
+    if max(ch, cw) > _MAX_CROP_SIDE:
+        scale = _MAX_CROP_SIDE / float(max(ch, cw))
+        import cv2
+        crop = cv2.resize(
+            crop,
+            (max(8, int(round(cw * scale))), max(8, int(round(ch * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return crop, (x0, y0), scale
+
+
+def _encode_gray_jpeg(gray) -> bytes:
+    import cv2
+
+    ok, buf = cv2.imencode(".jpg", gray, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
+    if not ok:
+        raise RuntimeError("failed to JPEG-encode optical-flow crop")
+    return bytes(buf)
+
+
+def _decode_gray_jpeg(b64: str):
+    import cv2
+    import numpy as np
+
+    raw = _decode_image_b64(b64)
+    if not raw:
+        return None
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    gray = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    return gray
+
+
+def _init_state(gray, box: list[float], frame_size: tuple[int, int]) -> dict[str, Any]:
+    crop, origin, scale = _crop_gray_roi(gray, box)
+    jpeg = _encode_gray_jpeg(crop)
+    return {
+        "algo": "dis",
+        "v": 1,
+        "prev_jpeg_b64": base64.b64encode(jpeg).decode("ascii"),
+        "crop_origin": [int(origin[0]), int(origin[1])],
+        "crop_scale": float(scale),
+        "box": [round(v, 2) for v in box],
+        "frame_size": [int(frame_size[0]), int(frame_size[1])],
+    }
+
+
+def _dis_create():
+    import cv2
+
+    preset = getattr(cv2, "DISOPTICAL_FLOW_PRESET_FAST", 1)
+    if hasattr(cv2, "DISOpticalFlow_create"):
+        return cv2.DISOpticalFlow_create(preset)
+    if hasattr(cv2, "DISOpticalFlow") and hasattr(cv2.DISOpticalFlow, "create"):
+        return cv2.DISOpticalFlow.create(preset)
+    raise RuntimeError("cv2.DISOpticalFlow is not available")
+
+
+def _local_dis_step(bgr, shape: Any, state: Any) -> tuple[list[float] | None, dict[str, Any], bool, float]:
+    import cv2
+    import numpy as np
+
+    h, w = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    prev_box = None
+    if isinstance(state, dict):
+        prev_box = _parse_box(state.get("box") or state.get("shape"))
+    box = _parse_box(shape, prev_box)
+    if box is None:
+        return None, {"algo": "dis", "lost": True}, True, 0.0
+
+    # First frame: initialize compact state, return the same box.
+    if not isinstance(state, dict) or not state.get("prev_jpeg_b64"):
+        clipped = _clip_box(box, w, h) or box
+        new_state = _init_state(gray, clipped, (w, h))
+        return [round(v, 2) for v in clipped], new_state, False, 1.0
+
+    prev_gray = _decode_gray_jpeg(str(state.get("prev_jpeg_b64") or ""))
+    if prev_gray is None or prev_gray.size == 0:
+        clipped = _clip_box(box, w, h) or box
+        new_state = _init_state(gray, clipped, (w, h))
+        return [round(v, 2) for v in clipped], new_state, False, 0.5
+
+    origin = state.get("crop_origin") or [0, 0]
+    try:
+        ox, oy = int(origin[0]), int(origin[1])
+    except (TypeError, ValueError, IndexError):
+        ox, oy = 0, 0
+    try:
+        scale = float(state.get("crop_scale") or 1.0) or 1.0
+    except (TypeError, ValueError):
+        scale = 1.0
+
+    ph, pw = prev_gray.shape[:2]
+    # Reconstruct the previous crop window in full-frame pixels.
+    src_w = max(8, int(round(pw / scale)))
+    src_h = max(8, int(round(ph / scale)))
+    x1 = min(w, ox + src_w)
+    y1 = min(h, oy + src_h)
+    curr_crop = np.ascontiguousarray(gray[oy:y1, ox:x1])
+    if curr_crop.size == 0 or curr_crop.shape[0] < 8 or curr_crop.shape[1] < 8:
+        lost_state = _init_state(gray, box, (w, h))
+        lost_state["lost"] = True
+        return [round(v, 2) for v in box], lost_state, True, 0.0
+
+    if curr_crop.shape[0] != ph or curr_crop.shape[1] != pw:
+        curr_crop = cv2.resize(curr_crop, (pw, ph), interpolation=cv2.INTER_LINEAR)
+    prev_gray = np.ascontiguousarray(prev_gray)
+    curr_crop = np.ascontiguousarray(curr_crop)
+
+    tracker = _dis_create()
+    flow = tracker.calc(prev_gray, curr_crop, None)
+    if flow is None or flow.size == 0:
+        lost_state = _init_state(gray, box, (w, h))
+        lost_state["lost"] = True
+        return [round(v, 2) for v in box], lost_state, True, 0.0
+
+    # Median flow inside the previous box, mapped into crop pixels.
+    bx0 = (box[0] - ox) * scale
+    by0 = (box[1] - oy) * scale
+    bx1 = (box[2] - ox) * scale
+    by1 = (box[3] - oy) * scale
+    ix0 = max(0, min(pw - 1, int(bx0)))
+    iy0 = max(0, min(ph - 1, int(by0)))
+    ix1 = max(ix0 + 1, min(pw, int(round(bx1))))
+    iy1 = max(iy0 + 1, min(ph, int(round(by1))))
+    region = flow[iy0:iy1, ix0:ix1]
+    if region.size == 0:
+        region = flow
+    dx_c = float(np.median(region[..., 0]))
+    dy_c = float(np.median(region[..., 1]))
+    dx = dx_c / scale
+    dy = dy_c / scale
+
+    vecs = region.reshape(-1, 2)
+    med = np.array([dx_c, dy_c], dtype=np.float32)
+    dist = np.linalg.norm(vecs - med, axis=1)
+    mad = float(np.median(dist)) if dist.size else 0.0
+    thr = max(1.5, 2.5 * mad) if mad > 1e-6 else 3.0
+    inliers = float(np.mean(dist <= thr)) if dist.size else 0.0
+    score = max(0.0, min(1.0, inliers))
+
+    new_box = [box[0] + dx, box[1] + dy, box[2] + dx, box[3] + dy]
+    clipped = _clip_box(new_box, w, h)
+    lost = _box_lost(clipped if clipped is not None else new_box, box, w, h, score)
+    out_box = clipped if clipped is not None else new_box
+    new_state = _init_state(gray, out_box, (w, h))
+    new_state["score"] = round(score, 4)
+    new_state["lost"] = bool(lost)
+    new_state["dx"] = round(dx, 3)
+    new_state["dy"] = round(dy, 3)
+    return [round(v, 2) for v in out_box], new_state, lost, score
+
+
+def _shape_out(box: list[float] | None, lost: bool) -> dict[str, Any] | None:
+    """Official TRACKER item. Empty points ⇒ UI stops this object (lost)."""
+    if lost or box is None:
+        return {"type": "rectangle", "points": []}
+    return {"type": "rectangle", "points": [round(v, 2) for v in box]}
+
+
+def _crop_bgr_for_http(bgr, box: list[float]):
+    import cv2
+
+    h, w = bgr.shape[:2]
+    pad = _pad_for_box(box)
+    x0 = max(0, int(box[0]) - pad)
+    y0 = max(0, int(box[1]) - pad)
+    x1 = min(w, int(round(box[2])) + pad)
+    y1 = min(h, int(round(box[3])) + pad)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return bgr, (0, 0)
+    crop = bgr[y0:y1, x0:x1]
+    ch, cw = crop.shape[:2]
+    if max(ch, cw) > _MAX_CROP_SIDE * 2:
+        scale = (_MAX_CROP_SIDE * 2) / float(max(ch, cw))
+        crop = cv2.resize(
+            crop,
+            (max(8, int(round(cw * scale))), max(8, int(round(ch * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    return crop, (x0, y0)
+
+
+def _http_track_one(
+    bgr,
+    box: list[float] | None,
+    state: Any,
+    cfg: dict,
+) -> tuple[list[float] | None, Any, bool, float]:
+    import cv2
+    import requests
+
+    api_url = str(cfg.get("api_url") or "").strip()
+    if not api_url:
+        raise ValueError("HTTP tracker requires config.api_url")
+
+    h, w = bgr.shape[:2]
+    origin = (0, 0)
+    send_bgr = bgr
+    send_box = box
+    if box is not None:
+        send_bgr, origin = _crop_bgr_for_http(bgr, box)
+        send_box = [
+            box[0] - origin[0],
+            box[1] - origin[1],
+            box[2] - origin[0],
+            box[3] - origin[1],
+        ]
+
+    ok, buf = cv2.imencode(".jpg", send_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        raise RuntimeError("failed to JPEG-encode HTTP tracker crop")
+    image_bytes = bytes(buf)
+    filename, content_type = _guess_image_meta(image_bytes)
+    file_field = str(cfg.get("http_file_field") or DEFAULT_FILE_FIELD).strip() or DEFAULT_FILE_FIELD
+    form_fields = _as_fields(cfg.get("http_form_fields"))
+    query_fields = _as_fields(cfg.get("http_query_fields"))
+    try:
+        timeout = float(cfg.get("http_timeout_seconds") or os.environ.get("HTTP_TRACK_TIMEOUT") or DEFAULT_TIMEOUT)
+    except (TypeError, ValueError):
+        timeout = DEFAULT_TIMEOUT
+    timeout = max(5.0, min(600.0, timeout))
+
+    url = merge_query_into_url(api_url, query_fields)
+    headers: dict[str, str] = {}
+    api_key = str(cfg.get("api_key") or "").strip()
+    if api_key:
+        header_name = str(cfg.get("http_auth_header") or "Authorization").strip() or "Authorization"
+        if header_name.lower() == "authorization" and not api_key.lower().startswith("bearer "):
+            headers[header_name] = f"Bearer {api_key}"
+        else:
+            headers[header_name] = api_key
+
+    shape_payload = {
+        "type": "rectangle",
+        "points": [round(v, 2) for v in (send_box or [0, 0, 0, 0])],
+    }
+    form_fields = dict(form_fields)
+    form_fields["shape"] = json.dumps(shape_payload, separators=(",", ":"))
+    form_fields["crop_origin"] = f"{origin[0]},{origin[1]}"
+    form_fields["frame_size"] = f"{w},{h}"
+    if state is not None:
+        try:
+            form_fields["state"] = json.dumps(state, separators=(",", ":"))
+        except (TypeError, ValueError):
+            form_fields["state"] = str(state)
+
+    files = {file_field: (filename, image_bytes, content_type)}
+    try:
+        resp = requests.post(
+            url,
+            files=files,
+            data=form_fields or None,
+            headers=headers or None,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"HTTP tracker POST {url} failed: {type(exc).__name__}: {str(exc)[:200]}"
+        ) from exc
+
+    if resp.status_code >= 400:
+        body = (resp.text or "")[:240]
+        raise RuntimeError(f"HTTP tracker {url} returned HTTP {resp.status_code}: {body}")
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        text = (resp.text or "").strip()
+        try:
+            payload = json.loads(text) if text else {}
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"HTTP tracker returned non-JSON body: {text[:200]}") from exc
+
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if code not in (None, 0, "0", "ok", "success", True):
+            msg = str(payload.get("message") or payload.get("error") or code)
+            raise RuntimeError(f"HTTP tracker returned error code={code}: {msg[:240]}")
+
+    lost = False
+    score = 1.0
+    out_state = state
+    out_box = None
+    if isinstance(payload, dict):
+        lost = bool(payload.get("lost"))
+        try:
+            if payload.get("score") is not None:
+                score = max(0.0, min(1.0, float(payload.get("score"))))
+        except (TypeError, ValueError):
+            score = 1.0
+        if "state" in payload:
+            out_state = payload.get("state")
+        shapes = payload.get("shapes")
+        if isinstance(shapes, list) and shapes:
+            out_box = _parse_box(shapes[0])
+        if out_box is None:
+            out_box = _parse_box(payload.get("shape"))
+        if out_box is None:
+            out_box = _parse_box(payload)
+
+    if out_box is not None:
+        # If the service returned crop-space coords, lift them back to the frame.
+        ch, cw = send_bgr.shape[:2]
+        looks_crop = out_box[2] <= cw * 1.25 and out_box[3] <= ch * 1.25
+        looks_full = out_box[2] > cw * 1.05 or out_box[3] > ch * 1.05
+        if looks_crop and not looks_full:
+            out_box = [
+                out_box[0] + origin[0],
+                out_box[1] + origin[1],
+                out_box[2] + origin[0],
+                out_box[3] + origin[1],
+            ]
+        clipped = _clip_box(out_box, w, h)
+        if clipped is None:
+            lost = True
+        else:
+            out_box = clipped
+            lost = lost or _box_lost(out_box, box, w, h, score)
+    else:
+        lost = True
+
+    if not isinstance(out_state, dict):
+        out_state = {"remote": out_state, "lost": lost, "score": score}
+    elif isinstance(out_state, dict):
+        out_state = dict(out_state)
+        out_state["lost"] = lost
+        out_state["score"] = score
+    return out_box, out_state, lost, score
+
+
+def infer_optical_flow_tracker(payload: dict | None, cfg: dict | None = None) -> dict[str, Any]:
+    """Official tracker contract: payload {image, shapes, states} → {shapes, states} (unsigned)."""
+    payload = payload if isinstance(payload, dict) else {}
+    cfg = cfg if isinstance(cfg, dict) else {}
+    image_b64 = payload.get("image") or ""
+    if not image_b64:
+        raise ValueError("optical-flow tracker payload is missing image")
+
+    bgr = _decode_bgr(str(image_b64))
+    shapes = list(payload.get("shapes") or [])
+    states = list(payload.get("states") or [])
+    n = max(len(shapes), len(states))
+    if n == 0:
+        return {"shapes": [], "states": []}
+
+    use_http = bool(str(cfg.get("api_url") or "").strip())
+    out_shapes: list[Any] = []
+    out_states: list[Any] = []
+    for i in range(n):
+        shape = shapes[i] if i < len(shapes) else None
+        state = states[i] if i < len(states) else None
+        prev_box = None
+        if isinstance(state, dict):
+            prev_box = _parse_box(state.get("box") or state.get("shape"))
+        box = _parse_box(shape, prev_box)
+        if use_http:
+            out_box, out_state, lost, _score = _http_track_one(bgr, box, state, cfg)
+        else:
+            out_box, out_state, lost, _score = _local_dis_step(bgr, shape, state)
+        out_shapes.append(_shape_out(out_box, lost))
+        out_states.append(out_state)
+    return {"shapes": out_shapes, "states": out_states}

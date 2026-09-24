@@ -1,0 +1,74 @@
+metadata:
+  name: qwen-bailian-qwen37-detector
+  namespace: cvat
+  annotations:
+    name: Qwen Bailian 3.7 Detector
+    type: detector
+    bailian: "true"
+    spec: |
+      [
+        { "id": 0, "name": "pedestrian", "type": "rectangle" },
+        { "id": 1, "name": "cyclist", "type": "rectangle" },
+        { "id": 2, "name": "motor_vehicle", "type": "rectangle" },
+        { "id": 3, "name": "non_motor_vehicle", "type": "rectangle" },
+        { "id": 4, "name": "traffic_cone", "type": "rectangle" },
+        { "id": 5, "name": "traffic_bucket", "type": "rectangle" },
+        { "id": 6, "name": "traffic_column", "type": "rectangle" },
+        { "id": 7, "name": "plastic_barrier", "type": "rectangle" },
+        { "id": 8, "name": "guard_rail", "type": "rectangle" }
+      ]
+spec:
+  description: Qwen Bailian 3.7 detector via HTTP API
+  runtime: 'python:3.10'
+  handler: main:handler
+  eventTimeout: 60s
+
+  # ================================================================
+  # 【v15-fix5a REFACTOR 关键！main.py L578-L580 需要的3个环境变量永久注入】
+  # 为什么必须写在 function.yaml spec.env 节？
+  #   因为 Linux 进程的环境变量=容器创建时从 /proc/<PID>/environ 加载，
+  #   运行时用 docker exec 写 /etc/environment 对已运行的 Python 进程完全无效！
+  #   → 只有 nuctl deploy 时在 spec.env 声明的变量，才能 100% 永久进入 main.py 的 os.environ。
+  #
+  # 格式：Nuclio 支持 {{ .Env.XXX }} 模板替换（从宿主 shell 的环境变量取值）
+  #   → 部署前在宿主 shell 先 export：
+  #       export BAILIAN_API_KEY="sk-xxxx"
+  #       export BAILIAN_API_URL="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+  #       export BAILIAN_MODEL="qwen3-vl-plus"
+  #     再执行 nuctl deploy → 模板自动替换为真实值。
+  #   → 安全起见：如果宿主没export，默认值是空字符串，main.py 会从 payload.bailian 兜底拿（解耦双保险）
+  # ================================================================
+  env:
+    - name: BAILIAN_API_KEY
+      value: "{{ .Env.BAILIAN_API_KEY }}"
+    - name: BAILIAN_API_URL
+      value: "{{ .Env.BAILIAN_API_URL }}"
+    - name: BAILIAN_MODEL
+      value: "{{ .Env.BAILIAN_MODEL }}"
+
+  build:
+    image: cvat.qwen.bailian.qwen37.detector
+    baseImage: ubuntu:22.04
+    directives:
+      preCopy:
+        - kind: RUN
+          value: apt-get update && apt-get install --no-install-recommends -y python3-pip python-is-python3 && rm -rf /var/lib/apt/lists/*
+        - kind: RUN
+          value: pip install pillow pyyaml requests --no-cache-dir
+        - kind: WORKDIR
+          value: /opt/nuclio
+
+  triggers:
+    myHttpTrigger:
+      numWorkers: 2
+      kind: 'http'
+      workerAvailabilityTimeoutMilliseconds: 10000
+      attributes:
+        maxRequestBodySize: 33554432
+
+  platform:
+    attributes:
+      restartPolicy:
+        name: always
+        maximumRetryCount: 3
+      mountMode: volume

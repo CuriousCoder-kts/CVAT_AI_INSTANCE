@@ -1,0 +1,305 @@
+# Copyright (C) 2021-2022 Intel Corporation
+# Copyright (C) CVAT.ai Corporation
+#
+# SPDX-License-Identifier: MIT
+
+import base64
+import hashlib
+import json
+from datetime import timedelta
+
+from allauth.account.adapter import get_adapter
+from cryptography.fernet import Fernet, InvalidToken
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.sites.shortcuts import get_current_site
+from django.core.exceptions import ImproperlyConfigured
+from django.db import models
+from django.utils import timezone
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema_field
+
+from cvat.apps.engine.models import TimestampedModel
+
+
+_fernet_singleton: Fernet | None = None
+
+
+def _get_fernet() -> Fernet:
+    global _fernet_singleton
+    if _fernet_singleton is None:
+        if not settings.SECRET_KEY:
+            raise ImproperlyConfigured("SECRET_KEY must be configured to use encrypted fields")
+        digest = hashlib.sha256(settings.SECRET_KEY.encode("utf-8")).digest()
+        key = base64.urlsafe_b64encode(digest)
+        _fernet_singleton = Fernet(key)
+    return _fernet_singleton
+
+
+class EncryptedJSONField(models.TextField):
+    description = "JSON serialized and symmetrically encrypted with SECRET_KEY (Fernet)"
+
+    SENSITIVE_KEY_SUBSTRINGS = ("key", "secret", "token", "password")
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("default", dict)
+        super().__init__(*args, **kwargs)
+
+    def _encrypt(self, value) -> str:
+        if value is None:
+            value = {}
+        payload = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        return _get_fernet().encrypt(payload).decode("ascii")
+
+    def _decrypt(self, value: str):
+        # Fast path: Fernet token always starts with "gAAAAA" (Fernet v1 format)
+        if not isinstance(value, str):
+            return {}
+        value_stripped = value.strip()
+        if not value_stripped:
+            return {}
+
+        if value_stripped.startswith("gAAAAA"):
+            try:
+                raw = _get_fernet().decrypt(value_stripped.encode("ascii"))
+                return json.loads(raw.decode("utf-8"))
+            except (InvalidToken, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+        # Fallback path A: strict JSON (apps.get_model frozen model may have written
+        # serialized JSON for some rows).
+        if value_stripped.startswith("{") or value_stripped.startswith("["):
+            try:
+                return json.loads(value_stripped)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+        # Fallback path B: Python repr dict/list literal str(dict) uses single
+        # quotes, e.g. "{'key': 'value'}" — not valid JSON. This happens when
+        # migrations.RunPython (apps.get_model frozen field = TextField) writes
+        # a dict via str(value) since the frozen model has no get_prep_value hook.
+        # ast.literal_eval is the Python-stdlib safe evaluator (arbitrary value
+        # literals only, no code execution).
+        if value_stripped[:1] in ("{", "["):
+            import ast as _ast
+            try:
+                parsed = _ast.literal_eval(value_stripped)
+                if isinstance(parsed, (dict, list)):
+                    return parsed
+            except (ValueError, SyntaxError, MemoryError, RecursionError):
+                pass
+        return {}
+
+    def get_prep_value(self, value):
+        if value is None:
+            return self._encrypt({})
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = {"_raw_str": value}
+            return self._encrypt(parsed)
+        return self._encrypt(value)
+
+    def from_db_value(self, value, expression, connection):
+        if value is None or value == "":
+            return {}
+        if isinstance(value, (dict, list)):
+            return value
+        return self._decrypt(value)
+
+    def value_to_string(self, obj):
+        value = self.value_from_object(obj)
+        return self.get_prep_value(value)
+
+    def deconstruct(self):
+        name, path, args, kwargs = super().deconstruct()
+        return name, path, args, kwargs
+
+
+class FeatureKind(models.TextChoices):
+    OBJECT_DETECTOR = "object_detector"
+    INTENTION_ESTIMATION = "intention_estimation"
+    IMAGE_CAPTION = "image_caption"
+    POSE_ESTIMATION = "pose_estimation"
+
+
+class ProviderKind(models.TextChoices):
+    BAILIAN = "bailian"
+    LOCAL = "local"
+    OPENAI = "openai"
+    CUSTOM = "custom"
+
+
+class Organization(TimestampedModel):
+    slug = models.SlugField(max_length=16, blank=False, unique=True)
+    name = models.CharField(max_length=64, blank=True)
+    description = models.TextField(blank=True)
+    contact = models.JSONField(blank=True, default=dict)
+
+    owner = models.ForeignKey(
+        get_user_model(), null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    def __str__(self):
+        return self.slug
+
+    class Meta:
+        default_permissions = ()
+
+
+class Membership(models.Model):
+    WORKER = "worker"
+    SUPERVISOR = "supervisor"
+    MAINTAINER = "maintainer"
+    OWNER = "owner"
+
+    user = models.ForeignKey(
+        get_user_model(), on_delete=models.CASCADE, null=True, related_name="memberships"
+    )
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="members")
+    is_active = models.BooleanField(default=False)
+    joined_date = models.DateTimeField(null=True)
+    role = models.CharField(
+        max_length=16,
+        choices=[
+            (WORKER, "Worker"),
+            (SUPERVISOR, "Supervisor"),
+            (MAINTAINER, "Maintainer"),
+            (OWNER, "Owner"),
+        ],
+    )
+
+    class Meta:
+        default_permissions = ()
+        unique_together = ("user", "organization")
+
+
+# Inspired by https://github.com/bee-keeper/django-invitations
+class Invitation(models.Model):
+    key = models.CharField(max_length=64, primary_key=True)
+    created_date = models.DateTimeField(auto_now_add=True)
+    sent_date = models.DateTimeField(null=True)
+    owner = models.ForeignKey(get_user_model(), null=True, on_delete=models.SET_NULL)
+    membership = models.OneToOneField(Membership, on_delete=models.CASCADE)
+
+    @property
+    def organization_id(self):
+        return self.membership.organization_id
+
+    @property
+    @extend_schema_field(OpenApiTypes.BOOL)
+    def expired(self):
+        if self.sent_date:
+            expiration_date = self.sent_date + timedelta(
+                days=settings.ORG_INVITATION_EXPIRY_DAYS,
+            )
+            return expiration_date <= timezone.now()
+        return None
+
+    @property
+    @extend_schema_field(OpenApiTypes.BOOL)
+    def accepted(self):
+        return self.membership.is_active
+
+    @property
+    def organization_slug(self):
+        return self.membership.organization.slug
+
+    def send(self, request):
+        if settings.EMAIL_BACKEND is None:
+            raise ImproperlyConfigured("Email backend is not configured")
+
+        target_email = self.membership.user.email
+        current_site = get_current_site(request)
+        site_name = current_site.name
+        domain = current_site.domain
+        context = {
+            "email": target_email,
+            "invitation_key": self.key,
+            "domain": domain,
+            "site_name": site_name,
+            "invitation_owner": self.owner.get_username(),
+            "organization_name": self.membership.organization.slug,
+            "protocol": "https" if request.is_secure() else "http",
+        }
+
+        get_adapter(request).send_mail("invitation/invitation", target_email, context)
+
+        self.sent_date = timezone.now()
+        self.save()
+
+    def accept(self, date=None):
+        if not self.membership.is_active:
+            self.membership.is_active = True
+            if date is None:
+                self.membership.joined_date = timezone.now()
+            else:
+                self.membership.joined_date = date
+            self.membership.save()
+
+    class Meta:
+        default_permissions = ()
+
+
+class BailianSettings(TimestampedModel):
+    organization = models.OneToOneField(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="bailian_settings",
+    )
+    api_url = models.URLField(max_length=2048, blank=True, default="")
+    model = models.CharField(max_length=128, blank=True, default="")
+    api_key = models.TextField(blank=True, default="")
+    updated_by = models.ForeignKey(
+        get_user_model(),
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+
+    class Meta:
+        default_permissions = ()
+
+
+class AIFunctionInstance(TimestampedModel):
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="ai_function_instances",
+    )
+    slug = models.SlugField(max_length=64, blank=False)
+    name = models.CharField(max_length=128, blank=False)
+
+    feature_kind = models.CharField(max_length=32, choices=FeatureKind.choices)
+    provider = models.CharField(
+        max_length=32, choices=ProviderKind.choices, default=ProviderKind.BAILIAN
+    )
+
+    is_enabled = models.BooleanField(default=True)
+    is_default = models.BooleanField(default=False)
+
+    config = EncryptedJSONField(blank=True, default=dict)
+
+    nuclio_function_id = models.CharField(max_length=256, blank=True, default="")
+
+    updated_by = models.ForeignKey(
+        get_user_model(),
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    last_used_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        default_permissions = ()
+        unique_together = ("organization", "slug")
+        indexes = [
+            models.Index(fields=["organization", "feature_kind", "is_default"]),
+            models.Index(fields=["organization", "is_enabled"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.organization.slug}/{self.slug} ({self.feature_kind})"

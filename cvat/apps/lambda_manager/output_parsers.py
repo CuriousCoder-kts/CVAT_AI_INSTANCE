@@ -1,0 +1,837 @@
+"""
+Output parsers: registry pattern for converting VLM raw text / JSON arrays
+into UnifiedAnnotation lists.
+
+Extensibility contract
+======================
+Each parser is a callable with the signature:
+    def parser(raw_output: str,
+               parser_config: dict,        # <- output_parser_config from config
+               image_size: tuple[int,int], # (width_px, height_px)
+               label_spec: list[dict]) -> list[UnifiedAnnotation]
+
+New annotation shapes are added by ONE function + one ANNOTATION_PARSERS entry.
+This matches Dify / LangFlow's "each tool declares its own output format" model.
+
+Supported parsers (MVP v0):
+  * rectangles   <- legacy 9-class traffic detector; canonical_1000 or real_pixel coords
+  * polygons     <- same as rectangles but points can be >4 values (VLM outputs polygons)
+  * captions     <- VLM outputs a text description → CVAT image-level tag/attribute
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+from typing import Any, Callable
+
+from .unified_types import UnifiedAnnotation
+from .http_microservice import is_placeholder_label
+
+
+# ======================================================================
+# Reusable JSON extraction pipeline — 1:1 copy of main.py helpers so
+# downstream parsers never reimplement buggy parsing.
+# ======================================================================
+
+def _strip_markdown(text: str) -> str:
+    if not text:
+        return ""
+    text = str(text).strip()
+    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```\s*$", "", text)
+    return text.strip()
+
+
+def _repair_json_grammar(text: str) -> str:
+    """Tuple-bracket -> square-bracket repairs only at the array-literal level.
+
+    Deliberately conservative (matches main.py grammar repair):
+    we never touch parentheses that live inside JSON string values.
+    """
+    text = str(text)
+    text = re.sub(r"(?<=[\d\[\],])\)\s*,\s*\((?=[\d\[\{])", "],[", text)
+    text = re.sub(r"(?<=[\d\[\],])\)\s*,\s*\[(?=[\d\[\{])", "],[", text)
+    text = re.sub(r"(?<=[\d\[\],])\]\s*,\s*\((?=[\d\[\{])", "],[", text)
+    text = re.sub(r"(?<=\d)\s*\(\s*(?=[\d-])", "[ ", text)
+    text = re.sub(r"(?<=[\d-])\s*\)\s*(?=\s*[,\]\}]|$)", " ]", text)
+    text = re.sub(r"(?<=\d)\s*,\s*\((?=[\d-])", ", [", text)
+    text = re.sub(r"(?<=[\[\{,])\(\s*(?=[\d-])", "[", text)
+    text = re.sub(r"(?<=[\d-])\)\s*,\s*(?=[\d\[\{])", "],", text)
+    text = re.sub(r"(?<=[\d-])\)\s*(?=\s*[\[\{])", "]", text)
+    text = re.sub(r"(\]|\})\s+(\[|\{)", r"\1,\2", text)
+    # Remove trailing commas before closing ] / } — common VLM JSON mistake
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+
+_LIST_KEYS = (
+    "objects", "annotations", "labels", "shapes", "instances",
+    "results", "detections", "items", "detections_", "boxes",
+)
+
+
+def extract_json_array(raw: str) -> list[dict]:
+    """Extract a JSON array from model output.  Mirrors main.py _extract_json."""
+    if not raw:
+        return []
+    text_clean = _strip_markdown(raw)
+
+    def _attempt(candidate: str) -> list[dict] | None:
+        if not candidate:
+            return None
+        candidate = candidate.strip()
+        if candidate.startswith("["):
+            arr = json.loads(candidate)
+            if isinstance(arr, list):
+                return [x for x in arr if isinstance(x, dict)]
+        if candidate.startswith("{"):
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                for k in _LIST_KEYS:
+                    v = obj.get(k)
+                    if isinstance(v, list):
+                        return [x for x in v if isinstance(x, dict)]
+                # single-object dict: wrap as list
+                return [obj]
+        # fallback: try to find outer [...] substring
+        start = candidate.find("[")
+        end = candidate.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            arr = json.loads(candidate[start : end + 1])
+            if isinstance(arr, list):
+                return [x for x in arr if isinstance(x, dict)]
+        m = re.search(r"(\{.*\})", candidate, flags=re.S)
+        if m:
+            obj = json.loads(m.group(1))
+            if isinstance(obj, dict):
+                for k in _LIST_KEYS:
+                    v = obj.get(k)
+                    if isinstance(v, list):
+                        return [x for x in v if isinstance(x, dict)]
+                return [obj]
+        return None
+
+    last_err = None
+    for candidate in (text_clean, _repair_json_grammar(text_clean)):
+        try:
+            result = _attempt(candidate)
+            if result is not None:
+                return result
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_err = exc
+            continue
+    # Swallow unparseable output (same behavior as main.py fallback: [])
+    # Caller logs via its own logger when available.
+    _ = last_err
+    return []
+
+
+def _normalize_label(label: object) -> str:
+    label = str(label).strip().lower()
+    label = label.replace("-", "_").replace(" ", "_")
+    label = re.sub(r"_+", "_", label)
+    return label
+
+
+def _label_spec_name_set(labels: list[dict]) -> set[str]:
+    raw = set()
+    for item in labels:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            raw.add(_normalize_label(item["name"]))
+    return raw
+
+
+def _fuzzy_resolve_label(
+    norm_lbl: str,
+    allowed_set: set[str],
+    label_spec: list[dict],
+    *,
+    min_similarity: float = 0.68,
+) -> tuple[str, bool]:
+    """
+    R8 Prompt 自由模式：宽松 label 名匹配 + 未匹配 FREE LABEL 直接保留。
+
+    输入 norm_lbl = VLM 返回的 label（已 normalize，小写下划线）。
+    行为：
+      1) norm_lbl 直接在 allowed_set 里 → (原name, True 命中白名单)
+      2) 遍历 label_spec，做 fuzzy（编辑距离 + 拼音/子串）匹配，最相似的 >= min_similarity
+         → (匹配到的规范名, True 推荐映射)
+      3) 没有任何匹配 → (norm_lbl, False 自由检测新增标签)
+        【关键改变！】之前 3) 的情况是 continue 直接丢，导致 prompt 里自由写的
+        新 label 永远进不了后续流程。现在 FREE LABEL 直接返回，靠后端 R8 兜底
+        自动在 Project 里 get_or_create 出对应 Label 并存入 DB。
+    """
+    if not norm_lbl:
+        return "", False
+    if not allowed_set:
+        # 白名单本身就是空（FREE_DETECT 模式）→ 所有 label 都是自由的
+        return norm_lbl, False
+    if norm_lbl in allowed_set:
+        return norm_lbl, True
+
+    # ====== Fuzzy matching: token overlap + SequenceMatcher ratio ======
+    try:
+        from difflib import SequenceMatcher
+    except Exception:  # noqa: BLE001
+        SequenceMatcher = None  # type: ignore[assignment]
+
+    best_name = ""
+    best_score = 0.0
+    nl_tokens: set[str] = set(filter(None, norm_lbl.split("_")))
+    # 中文：把原 _ 切的碎片按字符再拆
+    for ch in list(norm_lbl.replace("_", "")):
+        if ord(ch) > 127:
+            nl_tokens.add(ch)
+
+    for spec in label_spec:
+        if not isinstance(spec, dict):
+            continue
+        sname = str(spec.get("name") or "")
+        norm_s = _normalize_label(sname)
+        if not norm_s:
+            continue
+        # exact 相等（大小写/分隔符差异？已经 normalize 过就不可能）
+        if norm_s == norm_lbl:
+            return norm_s, True
+        s_tokens: set[str] = set(filter(None, norm_s.split("_")))
+        for ch in list(norm_s.replace("_", "")):
+            if ord(ch) > 127:
+                s_tokens.add(ch)
+        # --- token overlap score ---
+        denom = max(1, len(nl_tokens | s_tokens))
+        overlap_score = float(len(nl_tokens & s_tokens)) / float(denom)
+        # --- SequenceMatcher ratio ---
+        seq_score = 0.0
+        if SequenceMatcher is not None:
+            try:
+                seq_score = SequenceMatcher(None, norm_lbl, norm_s).ratio()
+            except Exception:
+                seq_score = 0.0
+        # 描述里可能写了中文别名 → 也做一次字符匹配
+        desc_score = 0.0
+        desc = str(spec.get("description") or "").strip().lower()
+        if desc:
+            try:
+                if SequenceMatcher is not None:
+                    desc_score = SequenceMatcher(
+                        None, norm_lbl, _normalize_label(desc)
+                    ).ratio()
+            except Exception:
+                desc_score = 0.0
+        score = max(overlap_score * 0.9, seq_score, desc_score * 0.85)
+        if score > best_score:
+            best_score = score
+            best_name = norm_s
+
+    if best_name and best_score >= min_similarity:
+        return best_name, True
+
+    # ====== FREE LABEL: 没匹配到也不丢！直接返回 ======
+    return norm_lbl, False
+
+
+# ======================================================================
+# Shared geometry helpers
+# ======================================================================
+
+def _canonical_1000_to_real_pixels(coord: float, image_side_px: int) -> int:
+    ratio = max(0.0, min(1.0, float(coord) / 1000.0))
+    return int(round(ratio * float(image_side_px)))
+
+
+def _coord_to_real_pixels(
+    value: float,
+    image_side_px: int,
+    coordinate_system: str,
+) -> int:
+    if coordinate_system == "real_pixel":
+        return int(round(float(value)))
+    if coordinate_system == "normalized_0_1":
+        ratio = max(0.0, min(1.0, float(value)))
+        return int(round(ratio * float(image_side_px)))
+    # default "canonical_1000" (main.py default)
+    return _canonical_1000_to_real_pixels(value, image_side_px)
+
+
+def _iou(a: list[float], b: list[float]) -> float:
+    ax1, ay1, ax2, ay2 = a[0], a[1], a[2], a[3]
+    bx1, by1, bx2, by2 = b[0], b[1], b[2], b[3]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    b_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = a_area + b_area - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def _nms(
+    candidates: list[dict[str, Any]],
+    iou_threshold: float,
+) -> list[dict[str, Any]]:
+    """Per-label greedy NMS.  Matches main.py _nms signature exactly."""
+    if not candidates:
+        return []
+    kept: list[dict[str, Any]] = []
+    by_label: dict[str, list[dict]] = {}
+    for c in candidates:
+        by_label.setdefault(c.get("label", "__unknown__"), []).append(c)
+    for items in by_label.values():
+        items_sorted = sorted(items, key=lambda c: float(c.get("confidence", 0.0)), reverse=True)
+        while items_sorted:
+            current = items_sorted.pop(0)
+            kept.append(current)
+            survivors = []
+            a_box = current.get("_box")
+            if a_box is None:
+                continue
+            for other in items_sorted:
+                b_box = other.get("_box")
+                if b_box is None or _iou(a_box, b_box) < iou_threshold:
+                    survivors.append(other)
+            items_sorted = survivors
+    return kept
+
+
+# ======================================================================
+# Parser 1: rectangles — legacy 9-class traffic detector (6-layer filter
+# + NMS + ped_cyclist merge + 2nd-call recall), driven by config.
+# ======================================================================
+
+def parse_rectangles(
+    raw_output: str,
+    parser_config: dict,
+    image_size: tuple[int, int],
+    label_spec: list[dict],
+    *,
+    runtime_threshold: float | None = None,
+) -> list[UnifiedAnnotation]:
+    width, height = image_size
+    total_pixels = max(1, width * height)
+
+    coordinate_system = str(parser_config.get("coordinate_system", "canonical_1000"))
+    threshold = (
+        runtime_threshold
+        if runtime_threshold is not None
+        else float(parser_config.get("confidence_threshold_default", 0.5))
+    )
+    threshold = max(0.0, min(1.0, float(threshold)))
+
+    canonical_min_span = int(parser_config.get("canonical_box_min_span", 6))
+    global_area_min = int(parser_config.get("global_area_min_px", 100))
+    global_ratio_min = float(parser_config.get("global_ratio_min", 0.02))
+    global_ratio_max = float(parser_config.get("global_ratio_max", 50.0))
+    global_area_ratio_max = float(parser_config.get("global_area_ratio_max_per_image", 0.95))
+    per_label_min_area: dict = parser_config.get("per_label_min_area_px_soft", {}) or {}
+    label_specific_rules: dict = parser_config.get("label_specific_rules", {}) or {}
+
+    allowed_set = _label_spec_name_set(label_spec)
+    fuzzy_hit_counters: dict[str, int] = {"whitelist": 0, "fuzzy_map": 0, "free_label": 0}
+
+    items = extract_json_array(raw_output)
+    if not isinstance(items, list):
+        items = []
+
+    # --- layer 1..6: coordinate, size, confidence, global, per-label filters ---
+    candidates: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        norm_lbl = _normalize_label(item.get("label", ""))
+        if not norm_lbl or is_placeholder_label(norm_lbl):
+            continue
+        # ================================================================
+        # R8 Prompt 自由模式：宽松 resolve（白名单优先 + fuzzy 映射 + 新增 FREE LABEL 全保留）
+        # 之前：if allowed_set AND norm_lbl NOT IN allowed_set → continue 直接丢
+        # 之后：_fuzzy_resolve_label 三段式处理，只有空 name 才丢
+        # ================================================================
+        resolved, matched = _fuzzy_resolve_label(
+            norm_lbl, allowed_set, label_spec, min_similarity=0.68
+        )
+        if not resolved:
+            continue
+        if matched:
+            if norm_lbl in allowed_set or resolved in allowed_set:
+                fuzzy_hit_counters["whitelist"] += 1
+            else:
+                fuzzy_hit_counters["fuzzy_map"] += 1
+        else:
+            fuzzy_hit_counters["free_label"] += 1
+        norm_lbl = resolved
+        # find geometry under flexible keys: box / bbox / points
+        raw_4: list[float] | None = None
+        raw_conf: float | None = item.get("confidence")
+        for key in ("box", "bbox", "points"):
+            v = item.get(key)
+            if isinstance(v, list) and len(v) >= 4:
+                raw_4 = [float(v[0]), float(v[1]), float(v[2]), float(v[3])]
+                break
+        if raw_4 is None:
+            continue
+
+        # Handle canonical_1000 range check; for other systems skip the 0..1000 check
+        if coordinate_system == "canonical_1000":
+            if not all(0.0 <= c <= 1000.0 for c in raw_4):
+                continue
+            cspan_x = abs(raw_4[2] - raw_4[0])
+            cspan_y = abs(raw_4[3] - raw_4[1])
+            if cspan_x < canonical_min_span or cspan_y < canonical_min_span:
+                continue
+
+        px1 = _coord_to_real_pixels(raw_4[0], width, coordinate_system)
+        py1 = _coord_to_real_pixels(raw_4[1], height, coordinate_system)
+        px2 = _coord_to_real_pixels(raw_4[2], width, coordinate_system)
+        py2 = _coord_to_real_pixels(raw_4[3], height, coordinate_system)
+
+        xtl = max(0, min(px1, px2))
+        ytl = max(0, min(py1, py2))
+        xbr = min(width, max(px1, px2))
+        ybr = min(height, max(py1, py2))
+        if xbr <= xtl or ybr <= ytl:
+            continue
+
+        try:
+            conf = float(raw_conf) if raw_conf is not None else 0.6
+        except (TypeError, ValueError):
+            conf = 0.6
+        conf = max(0.0, min(1.0, conf))
+        if conf < threshold:
+            continue
+
+        area_px = int((xbr - xtl) * (ybr - ytl))
+        area_ratio = float(area_px) / float(total_pixels)
+        if area_ratio > global_area_ratio_max:
+            continue
+
+        bw = float(xbr - xtl)
+        bh = float(ybr - ytl)
+        ratio = bw / bh if bh > 0 else float("inf")
+        if area_px < global_area_min or ratio < global_ratio_min or ratio > global_ratio_max:
+            continue
+
+        per_lbl_min = per_label_min_area.get(norm_lbl)
+        if per_lbl_min is not None and area_px < int(per_lbl_min):
+            continue
+
+        # Label-specific hard constraints (traffic_bucket / traffic_column)
+        rules = label_specific_rules.get(norm_lbl) or {}
+        if rules:
+            if coordinate_system == "canonical_1000":
+                cy_min = min(raw_4[1], raw_4[3])
+                cy_max = max(raw_4[1], raw_4[3])
+                if "y_min_canonical_min" in rules and cy_min < float(rules["y_min_canonical_min"]):
+                    continue
+                if "height_canonical_max" in rules and (cy_max - cy_min) > float(rules["height_canonical_max"]):
+                    continue
+            # forbidden_above_labels / merge_to_label_if_consecutive handled
+            # post-NMS (need global geometry context), so stash rule ref now
+            pass
+
+        candidates.append({
+            "confidence": conf,
+            "label": norm_lbl,
+            "_box": [float(xtl), float(ytl), float(xbr), float(ybr)],
+            "_points": [xtl, ytl, xbr, ybr],
+            "_needs_merge_rule": bool(rules.get("merge_to_label_if_consecutive")),
+        })
+
+    iou_nms = float(parser_config.get("iou_threshold_nms", 0.5))
+    kept = _nms(candidates, iou_threshold=iou_nms)
+
+    # --- ped+cycle+cyclist spatial merge (9-class legacy post-processing) ---
+    if parser_config.get("ped_cyclist_merge_enabled"):
+        kept = _apply_ped_cyclist_merge(kept, parser_config.get("ped_cyclist_merge_params", {}))
+
+    # --- label-specific consecutive-column merge (traffic_column/bucket → plastic_barrier) ---
+    kept = _apply_consecutive_column_merge(kept, label_specific_rules)
+
+    # --- low-confidence needs_review flag ---
+    low_conf_thr = float(parser_config.get("quality_gate", {}).get("low_confidence_threshold", 0.3) if isinstance(parser_config.get("quality_gate"), dict) else 0.3)
+
+    out: list[UnifiedAnnotation] = []
+    for item in kept:
+        conf = float(item.get("confidence", 0.0))
+        lbl = str(item.get("label", ""))
+        points = list(item.get("_points", [0, 0, 0, 0]))
+        out.append(UnifiedAnnotation(
+            type="rectangle",
+            label=lbl,
+            points=[int(p) for p in points],
+            confidence=conf,
+            worker_source="bailian_vlm_rect_parser",
+            needs_review=conf < low_conf_thr,
+        ))
+    # R8: 把 fuzzy/free_label 分类统计挂在返回值上（外层 slogger 打印用）
+    try:
+        parse_rectangles._last_stats = {  # type: ignore[attr-defined]
+            "whitelist": int(fuzzy_hit_counters.get("whitelist", 0)),
+            "fuzzy_map": int(fuzzy_hit_counters.get("fuzzy_map", 0)),
+            "free_label": int(fuzzy_hit_counters.get("free_label", 0)),
+            "total": len(out),
+        }
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _apply_ped_cyclist_merge(kept: list[dict], params: dict) -> list[dict]:
+    """Spatial merge: pedestrian + non_motor_vehicle → single cyclist union box.
+
+    1:1 behavioral copy of main.py _merge_ped_cycle_to_cyclist.  Parameterized
+    via parser_config.ped_cyclist_merge_params so users can tune per instance.
+    """
+    if not kept:
+        return kept
+    iou_min = float(params.get("iou_min", 0.015))
+    v_overlap_min = float(params.get("vertical_overlap_min", 0.65))
+    h_overlap_min = float(params.get("horizontal_overlap_min", 0.90))
+    center_max_width_ratio = float(params.get("center_max_width_ratio", 0.20))
+
+    peds = [k for k in kept if k.get("label") == "pedestrian"]
+    non_motors = [k for k in kept if k.get("label") == "non_motor_vehicle"]
+    existing_cyclists = [k for k in kept if k.get("label") == "cyclist"]
+    others = [k for k in kept if k.get("label") not in {"pedestrian", "non_motor_vehicle", "cyclist"}]
+
+    used_peds: set[int] = set()
+    used_non_motors: set[int] = set()
+    new_cyclists: list[dict] = []
+
+    for pi, ped in enumerate(peds):
+        pbox = ped["_box"]
+        pw = pbox[2] - pbox[0]
+        ph = pbox[3] - pbox[1]
+        p_cx = (pbox[0] + pbox[2]) * 0.5
+        p_cy = (pbox[1] + pbox[3]) * 0.5
+        best_ni = -1
+        best_score = 0.0
+        for ni, nm in enumerate(non_motors):
+            if ni in used_non_motors:
+                continue
+            nbox = nm["_box"]
+            nw = nbox[2] - nbox[0]
+            nh = nbox[3] - nbox[1]
+            n_cx = (nbox[0] + nbox[2]) * 0.5
+            n_cy = (nbox[1] + nbox[3]) * 0.5
+            iou = _iou(pbox, nbox)
+            # vertical overlap
+            y_overlap = max(0.0, min(pbox[3], nbox[3]) - max(pbox[1], nbox[1]))
+            y_union = max(pbox[3], nbox[3]) - min(pbox[1], nbox[1]) or 1e-6
+            v_overlap = y_overlap / y_union
+            x_overlap = max(0.0, min(pbox[2], nbox[2]) - max(pbox[0], nbox[0]))
+            x_union = max(pbox[2], nbox[2]) - min(pbox[0], nbox[0]) or 1e-6
+            h_overlap = x_overlap / x_union
+            max_dim = max(pw, nw, ph, nh) or 1.0
+            center_dist = math.hypot(p_cx - n_cx, p_cy - n_cy) / max_dim
+            center_ok = center_dist <= center_max_width_ratio
+            if iou < iou_min and v_overlap < v_overlap_min and not center_ok:
+                continue
+            if h_overlap < h_overlap_min and not center_ok:
+                continue
+            score = (
+                0.6 * iou
+                + 0.2 * v_overlap
+                + 0.1 * h_overlap
+                + 0.1 * (1.0 - min(1.0, center_dist / max(center_max_width_ratio, 1e-6)))
+            )
+            if best_ni < 0 or score > best_score:
+                best_ni = ni
+                best_score = score
+        if best_ni >= 0:
+            used_peds.add(pi)
+            used_non_motors.add(best_ni)
+            nb = non_motors[best_ni]["_box"]
+            xtl = min(pbox[0], nb[0])
+            ytl = min(pbox[1], nb[1])
+            xbr = max(pbox[2], nb[2])
+            ybr = max(pbox[3], nb[3])
+            new_conf = max(
+                float(ped.get("confidence", 0.6)),
+                float(non_motors[best_ni].get("confidence", 0.6)),
+            )
+            new_cyclists.append({
+                "confidence": new_conf,
+                "label": "cyclist",
+                "_box": [xtl, ytl, xbr, ybr],
+                "_points": [int(xtl), int(ytl), int(xbr), int(ybr)],
+            })
+
+    leftover_peds = [k for i, k in enumerate(peds) if i not in used_peds]
+    leftover_non_motors = [k for i, k in enumerate(non_motors) if i not in used_non_motors]
+    return others + existing_cyclists + leftover_peds + leftover_non_motors + new_cyclists
+
+
+def _apply_consecutive_column_merge(kept: list[dict], rules: dict) -> list[dict]:
+    """Merge consecutive traffic_column/bucket rows into a single plastic_barrier.
+
+    Driven by parser_config.label_specific_rules[<label>].merge_to_label_if_consecutive.
+    """
+    if not kept:
+        return kept
+    groups_needing_merge: dict[str, dict] = {}
+    for lbl_name, lbl_rules in rules.items():
+        merge_cfg = lbl_rules.get("merge_to_label_if_consecutive")
+        if isinstance(merge_cfg, dict):
+            groups_needing_merge[lbl_name] = merge_cfg
+    if not groups_needing_merge:
+        return kept
+
+    out: list[dict] = []
+    per_group_items: dict[str, list[dict]] = {}
+    for item in kept:
+        lbl = item.get("label", "")
+        if lbl in groups_needing_merge:
+            per_group_items.setdefault(lbl, []).append(item)
+        else:
+            out.append(item)
+
+    for lbl, merge_cfg in groups_needing_merge.items():
+        items = per_group_items.get(lbl, [])
+        if len(items) < int(merge_cfg.get("min_count", 3)):
+            out.extend(items)
+            continue
+        target_label = str(merge_cfg.get("target_label", "plastic_barrier"))
+        max_spacing_ratio = float(merge_cfg.get("spacing_avg_width_ratio", 3.0))
+        # Sort by x-center to detect "horizontal rows"
+        items_sorted = sorted(
+            items,
+            key=lambda k: (k["_box"][0] + k["_box"][2]) * 0.5,
+        )
+        runs: list[list[dict]] = [[items_sorted[0]]]
+        for item in items_sorted[1:]:
+            prev = runs[-1][-1]
+            p_box = prev["_box"]
+            i_box = item["_box"]
+            # Average width of both boxes
+            avg_w = 0.5 * ((p_box[2] - p_box[0]) + (i_box[2] - i_box[0]))
+            gap = max(0.0, i_box[0] - p_box[2])
+            # Consider same row if gap <= avgW * ratio AND y overlap >= 30%
+            if avg_w > 0 and gap <= max_spacing_ratio * avg_w:
+                p_ytl, p_ybr = p_box[1], p_box[3]
+                i_ytl, i_ybr = i_box[1], i_box[3]
+                y_overlap = max(0.0, min(p_ybr, i_ybr) - max(p_ytl, i_ytl))
+                y_union = max(p_ybr, i_ybr) - min(p_ytl, i_ytl) or 1e-6
+                if y_overlap / y_union >= 0.30:
+                    runs[-1].append(item)
+                    continue
+            runs.append([item])
+
+        for run in runs:
+            if len(run) >= int(merge_cfg.get("min_count", 3)):
+                xtl = min(b["_box"][0] for b in run)
+                ytl = min(b["_box"][1] for b in run)
+                xbr = max(b["_box"][2] for b in run)
+                ybr = max(b["_box"][3] for b in run)
+                conf = max(float(b.get("confidence", 0.6)) for b in run)
+                out.append({
+                    "confidence": conf,
+                    "label": target_label,
+                    "_box": [xtl, ytl, xbr, ybr],
+                    "_points": [int(xtl), int(ytl), int(xbr), int(ybr)],
+                })
+            else:
+                out.extend(run)
+    return out
+
+
+# ======================================================================
+# Parser 2: polygons — flexible point arrays (VLM outputs polygon shapes)
+# ======================================================================
+
+def parse_polygons(
+    raw_output: str,
+    parser_config: dict,
+    image_size: tuple[int, int],
+    label_spec: list[dict],
+    *,
+    runtime_threshold: float | None = None,
+) -> list[UnifiedAnnotation]:
+    width, height = image_size
+    coordinate_system = str(parser_config.get("coordinate_system", "canonical_1000"))
+    threshold = (
+        runtime_threshold
+        if runtime_threshold is not None
+        else float(parser_config.get("confidence_threshold_default", 0.5))
+    )
+    threshold = max(0.0, min(1.0, float(threshold)))
+    allowed_set = _label_spec_name_set(label_spec)
+    low_conf_thr = 0.3
+
+    items = extract_json_array(raw_output)
+    out: list[UnifiedAnnotation] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        norm_lbl = _normalize_label(item.get("label", ""))
+        if not norm_lbl or is_placeholder_label(norm_lbl):
+            continue
+        # R8 Prompt 自由模式：polygon parser 也走 fuzzy+free 宽松 resolve
+        resolved, _matched = _fuzzy_resolve_label(
+            norm_lbl, allowed_set, label_spec, min_similarity=0.68
+        )
+        if not resolved:
+            continue
+        norm_lbl = resolved
+        points_raw = None
+        for key in ("polygon", "points", "vertices", "coords"):
+            v = item.get(key)
+            if isinstance(v, list):
+                # Accept both shapes: [[x1,y1],[x2,y2],...]  (nested) and [x1,y1,x2,y2,...] (flat)
+                flat: list[float] = []
+                try:
+                    for elem in v:
+                        if isinstance(elem, (list, tuple)) and len(elem) >= 2:
+                            flat.append(float(elem[0]))
+                            flat.append(float(elem[1]))
+                        else:
+                            flat.append(float(elem))
+                except (TypeError, ValueError):
+                    continue
+                if len(flat) >= 6:
+                    points_raw = flat
+                    break
+        # Some VLMs still output "box" for polygons — fall back to rectangle
+        if points_raw is None:
+            for key in ("box", "bbox"):
+                v = item.get(key)
+                if isinstance(v, list) and len(v) >= 4:
+                    points_raw = [v[0], v[1], v[2], v[1], v[2], v[3], v[0], v[3]]
+                    break
+        if points_raw is None:
+            continue
+        try:
+            nums = [float(x) for x in points_raw]
+        except (TypeError, ValueError):
+            continue
+        if len(nums) % 2 != 0:
+            continue
+        real_px_points: list[int] = []
+        for i in range(0, len(nums), 2):
+            rx = _coord_to_real_pixels(nums[i], width, coordinate_system)
+            ry = _coord_to_real_pixels(nums[i + 1], height, coordinate_system)
+            rx = max(0, min(width, rx))
+            ry = max(0, min(height, ry))
+            real_px_points.extend([rx, ry])
+        if len(real_px_points) < 6:
+            continue
+        try:
+            conf = float(item.get("confidence", 0.6))
+        except (TypeError, ValueError):
+            conf = 0.6
+        conf = max(0.0, min(1.0, conf))
+        if conf < threshold:
+            continue
+        out.append(UnifiedAnnotation(
+            type="polygon",
+            label=norm_lbl,
+            points=real_px_points,
+            confidence=conf,
+            worker_source="bailian_vlm_polygon_parser",
+            needs_review=conf < low_conf_thr,
+        ))
+    return out
+
+
+# ======================================================================
+# Parser 3: captions / image-level description (输出类型: image_caption)
+# ======================================================================
+
+def parse_captions(
+    raw_output: str,
+    parser_config: dict,
+    image_size: tuple[int, int],
+    label_spec: list[dict],
+    *,
+    runtime_threshold: float | None = None,
+) -> list[UnifiedAnnotation]:
+    """Caption mode: VLM outputs a single sentence or {"caption":"..."} / {"description":"..."}.
+
+    Always returns a single UnifiedAnnotation with type="caption" whose label holds
+    the description text.  Downstream lambda handler maps this to CVAT's
+    image-level attribute (attribute name from parser_config.caption_attribute_name).
+    """
+    _ = runtime_threshold, image_size, label_spec
+    text = _strip_markdown(str(raw_output or "")).strip()
+    if not text:
+        return []
+    caption_text: str | None = None
+    try:
+        # Attempt structured JSON first ({"caption": "...", "description": "...", "tags": [...]})
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            for key in ("caption", "description", "text", "summary", "content"):
+                v = parsed.get(key)
+                if isinstance(v, str) and v.strip():
+                    caption_text = v.strip()
+                    break
+    except (json.JSONDecodeError, ValueError):
+        pass
+    if not caption_text:
+        # Unstructured plain text: take the first non-empty paragraph <= 500 chars
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            # Prefer lines that look like natural sentences (punctuation or long enough)
+            caption_text = lines[0][:500]
+    if not caption_text:
+        return []
+    attr_name = str(parser_config.get("caption_attribute_name", "描述"))
+    return [UnifiedAnnotation(
+        type="caption",
+        label=caption_text,
+        text=caption_text,
+        attributes={attr_name: caption_text},
+        confidence=1.0,
+        worker_source="bailian_vlm_caption_parser",
+        needs_review=False,
+    )]
+
+
+# ======================================================================
+# Registry: the ONLY place callers touch; extendability entry point.
+# ======================================================================
+
+_PARSER_SIGNATURE = Callable[[str, dict, tuple[int, int], list[dict]], list[UnifiedAnnotation]]
+
+ANNOTATION_PARSERS: dict[str, Callable[..., list[UnifiedAnnotation]]] = {
+    "rectangles": parse_rectangles,
+    "polygons": parse_polygons,
+    "captions": parse_captions,
+    # Future (v1+ when vision workers land):
+    #   "tags"       -> parse_tags
+    #   "skeletons"  -> parse_skeletons
+    #   "masks"      -> parse_masks (RLE / polygon masks from SAM2)
+}
+
+
+def run_parser(
+    output_format: str,
+    *,
+    raw_output: str,
+    parser_config: dict,
+    image_size: tuple[int, int],
+    label_spec: list[dict],
+    runtime_threshold: float | None = None,
+) -> list[UnifiedAnnotation]:
+    """Dispatch `raw_output` through the parser registered for `output_format`.
+
+    Falls back to rectangles parser when `output_format` is unknown — this
+    mirrors main.py's historical behavior so new configs that mistype the
+    format name still produce a usable (possibly empty) result.
+    """
+    parser = ANNOTATION_PARSERS.get(output_format)
+    if parser is None:
+        parser = parse_rectangles
+    kwargs: dict[str, Any] = {
+        "raw_output": raw_output,
+        "parser_config": parser_config or {},
+        "image_size": image_size,
+        "label_spec": label_spec or [],
+    }
+    if output_format in {"rectangles", "polygons"}:
+        kwargs["runtime_threshold"] = runtime_threshold
+    return parser(**kwargs)

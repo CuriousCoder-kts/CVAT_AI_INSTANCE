@@ -1,0 +1,517 @@
+/** Detector dual-head placeholders (e.g. 8082 GET /labels includes "None"). Never a CVAT label. */
+const PLACEHOLDER_LABEL_NAMES = new Set([
+    '', 'none', 'null', 'nil', 'n/a', 'na', 'nan', '-', 'unknown', 'nones',
+]);
+
+export function isPlaceholderLabel(name: string | null | undefined): boolean {
+    return PLACEHOLDER_LABEL_NAMES.has(String(name || '').trim().toLowerCase());
+}
+
+const LABEL_NAME_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+const LABEL_TYPES = new Set([
+    'rectangle', 'polygon', 'polyline', 'points', 'ellipse', 'circle',
+    'mask', 'cuboid', 'skeleton', 'tag', 'any',
+]);
+
+export interface LabelSpec {
+    name: string;
+    type?: 'rectangle' | 'polygon' | 'polyline' | 'points' | 'ellipse' | 'circle' | 'mask' | 'cuboid' | 'skeleton' | 'tag' | 'any';
+    description?: string;
+    color?: string;
+    attributes?: Array<{
+        name: string;
+        input_type?: 'text' | 'number' | 'checkbox' | 'select' | 'radio';
+        type?: string;
+        values?: string[];
+        default_value?: string | number | boolean;
+        mutable?: boolean;
+        description?: string;
+    }>;
+}
+
+function replaceTrailingCommas(value: string): string {
+    return value.replace(/,{1}[\s]*}/g, '}').replace(/,{1}[\s]*]/g, ']');
+}
+
+export function serializeLabelsRaw(labels: LabelSpec[] | undefined): string {
+    const rows = (Array.isArray(labels) ? labels : [])
+        .filter((item) => item && typeof item.name === 'string' && item.name.trim() && !isPlaceholderLabel(item.name))
+        .map((item) => {
+            const row: Record<string, unknown> = {
+                name: String(item.name).trim(),
+                type: item.type && LABEL_TYPES.has(item.type) ? item.type : 'any',
+                attributes: Array.isArray(item.attributes) ? item.attributes : [],
+            };
+            if (item.color) row.color = item.color;
+            if (item.description) row.description = item.description;
+            return row;
+        });
+    return `${JSON.stringify(rows, null, 2)}\n`;
+}
+
+export function parseLabelsRawJson(raw: string): LabelSpec[] {
+    let text = String(raw || '').trim();
+    if (!text) {
+        throw new Error('Paste a JSON array of labels');
+    }
+    if (!text.startsWith('[')) {
+        text = `[${text}]`;
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(replaceTrailingCommas(text));
+    } catch (error: any) {
+        throw new Error(error?.message || 'Invalid JSON');
+    }
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray((parsed as any).labels)) {
+        parsed = (parsed as any).labels;
+    }
+    if (!Array.isArray(parsed)) {
+        throw new Error('Field is expected to be a JSON array');
+    }
+    const out: LabelSpec[] = [];
+    const seen = new Set<string>();
+    for (const item of parsed) {
+        if (!item || typeof item !== 'object') {
+            throw new Error('Each label must be an object with name, type, attributes');
+        }
+        const name = String((item as any).name || '').trim();
+        if (!name || isPlaceholderLabel(name)) {
+            continue;
+        }
+        if (!LABEL_NAME_RE.test(name)) {
+            throw new Error(`Label name must be an ASCII identifier: ${name}`);
+        }
+        const key = name.toLowerCase();
+        if (seen.has(key)) {
+            throw new Error(`Label name must be unique: ${name}`);
+        }
+        seen.add(key);
+        const typeRaw = String((item as any).type || 'any').toLowerCase();
+        const type = LABEL_TYPES.has(typeRaw) ? typeRaw as LabelSpec['type'] : 'any';
+        const color = typeof (item as any).color === 'string' ? String((item as any).color).trim() : undefined;
+        const description = typeof (item as any).description === 'string' ? String((item as any).description) : '';
+        const attributes = Array.isArray((item as any).attributes) ? (item as any).attributes : [];
+        out.push({
+            name,
+            type,
+            description,
+            ...(color ? { color } : {}),
+            attributes,
+        });
+    }
+    if (!out.length) {
+        throw new Error('No usable labels in JSON (placeholder names like None are skipped)');
+    }
+    return out;
+}
+
+export interface PromptVariableSpec {
+    key: string;
+    label?: string;
+    type?: 'text' | 'textarea' | 'number' | 'select' | 'bool';
+    default?: string | number | boolean;
+    required?: boolean;
+    options?: string[];
+}
+
+export interface PresetBundle {
+    id: string;
+    name: string;
+    description: string;
+    appliesTo: Array<'object_detector' | 'image_caption' | 'object_tracker'>;
+    defaultFor: Array<'object_detector' | 'image_caption' | 'object_tracker'>;
+    defaults: {
+        execution_mode?: 'vlm_prompt' | 'vision_pipeline' | 'hybrid_agent';
+        output_format?: 'rectangles' | 'polygons' | 'captions' | 'polylines' | 'mixed';
+        provider?: 'bailian' | 'local' | 'openai' | 'custom';
+        model?: string;
+        api_url?: string;
+        local_backend?: string;
+        http_file_field?: string;
+        http_form_fields?: Record<string, string | number | boolean>;
+        http_timeout_seconds?: number;
+        system_prompt_template: string;
+        user_prompt_template: string;
+        prompt_variables?: PromptVariableSpec[];
+        output_parser_config?: Record<string, any>;
+        labels?: LabelSpec[];
+        caption_attribute_name?: string;
+    };
+}
+
+const POISON_PROMPT_VALUES = new Set(['undefined', 'string', 'null', 'nan', 'NaN', 'object', '[object Object]', '{}', '***PRESERVED***']);
+export function sanitizePromptValue(raw: any): string {
+    if (raw === null || raw === undefined) return '';
+    if (typeof raw !== 'string') {
+        try { return String(raw ?? ''); } catch { return ''; }
+    }
+    const trimmed = raw.trim();
+    if (POISON_PROMPT_VALUES.has(trimmed)) return '';
+    if (trimmed.length <= 1 && !trimmed.trim()) return '';
+    return raw;
+}
+
+export const PRESET_ID_ALIASES: Record<string, PresetBundle['id']> = {
+    'bailian-caption-simple-v1': 'generic_caption',
+    'bailian-caption-simple': 'generic_caption',
+    'bailian-detector-street-v9': 'traffic_9class_v9',
+    'bailian-streetscene-v9': 'traffic_9class_v9',
+    'streetscene-v9': 'traffic_9class_v9',
+    'qwen37-streetscene-v9': 'traffic_9class_v9',
+    'generic-detector': 'generic_detector',
+    'bailian-generic-detector': 'generic_detector',
+    'bailian-detector-generic': 'generic_detector',
+    'clrernet-lane': 'clrernet_lane_dla34',
+    'clrernet_dla34': 'clrernet_lane_dla34',
+    'lane-detector': 'clrernet_lane_dla34',
+    'http-detector': 'http_microservice_detector',
+    'http_detector': 'http_microservice_detector',
+    'http-microservice': 'http_microservice_detector',
+    'generic-http': 'http_microservice_detector',
+    'http-tracker': 'http_microservice_tracker',
+    'http_tracker': 'http_microservice_tracker',
+    'optical-flow': 'http_microservice_tracker',
+    'optical_flow': 'http_microservice_tracker',
+    'semi3d': 'semi3d_vehicle_detector',
+    'semi3d-detector': 'semi3d_vehicle_detector',
+    'vancar': 'semi3d_vehicle_detector',
+    'video-detector': 'semi3d_vehicle_detector',
+    '8082-detector': 'semi3d_vehicle_detector',
+};
+
+export const BUILTIN_PROMPT_VARIABLES: PromptVariableSpec[] = [
+    { key: 'image_width', label: 'Image width (px)', type: 'number' },
+    { key: 'image_height', label: 'Image height (px)', type: 'number' },
+    { key: 'total_pixels', label: 'Total pixels (px)', type: 'number' },
+    { key: 'label_categories_markdown', label: 'Label categories list (auto-generated from Labels tab)', type: 'textarea' },
+    { key: 'output_schema_markdown', label: 'Output JSON schema (auto-generated by Output format)', type: 'textarea' },
+    { key: 'confidence_threshold', label: 'Default confidence threshold', type: 'number', default: 0.5 },
+    { key: 'task_name', label: 'Current CVAT task name', type: 'text' },
+    { key: 'project_name', label: 'Current CVAT project name', type: 'text' },
+];
+
+const TRAFFIC_SYSTEM = `You are a senior traffic-scene annotator serving an autonomous-driving perception dataset team.
+Your job: given a single roadside camera image, produce a JSON array of labeled objects with pixel-accurate rectangles.
+
+## (1) GROUND RULES
+- Think aloud internally, but output ONLY a JSON array. Any explanatory text will corrupt the downstream parser.
+- Locate EVERY visible road-user / traffic-control object, even if partially occluded or truncated by the image edge.
+- For each object choose EXACTLY ONE label from the allowed list below. Do not invent synonyms or translate label text.
+- Each bounding box must satisfy the quality checklist:
+  a) Box is pixel-tight (no large margin around the object).
+  b) Box edges are aligned to the real object contour (not skewed by background).
+  c) Even heavily occluded objects get a box that covers their full extent as inferred from surrounding context and visible joints/wheels/patterns.
+- Confidence value: 0~1 float. 1.0 means visually perfectly clear; 0.5 means very ambiguous.
+
+## (2) LABEL DEFINITIONS (use these EXACT strings)
+{{label_categories_markdown}}
+
+## (3) OUTPUT FORMAT (MANDATORY JSON)
+{{output_schema_markdown}}`;
+
+const TRAFFIC_USER = `Please annotate the uploaded traffic-scene image.
+Image size: {{image_width}} x {{image_height}} px (total {{total_pixels}} pixels).
+
+- Output ONLY a JSON array with no other text, no markdown fences, no code blocks.
+- Minimum object size: any box whose shorter side is below 6 px is to be skipped (too small for perception training).
+- If a "cyclist" is carrying a rider, label the combined box as cyclist, not motor_vehicle.
+- For traffic_lights: include ALL visible traffic-light heads in a single bounding box per pole unit.
+- For plastic_barrier / traffic_bucket / traffic_column / traffic_cone: group individual small items into one box only when they are literally welded/joined (each standalone cone/bucket gets its own box).
+- Apply default confidence threshold >= {{confidence_threshold}}; objects below this still report if you think they are real but ambiguous.
+`;
+
+const GENERIC_DET_SYSTEM = `You are a general-purpose visual annotator.
+Your job: given a single image, produce a JSON array of labeled objects with bounding boxes.
+
+Ground rules:
+- Output ONLY a JSON array (no prose).
+- Use labels supplied below; do not invent new labels.
+- Produce pixel-tight rectangles; even occluded objects must be boxed to their full inferred extent.
+- Confidence value: 0~1 float.
+
+Labels (if any are declared below):
+{{label_categories_markdown}}
+
+Output schema:
+{{output_schema_markdown}}`;
+
+const GENERIC_DET_USER = `Please annotate the uploaded image.
+Image size: {{image_width}} x {{image_height}} px (total {{total_pixels}} pixels).
+
+Task name: {{task_name}}  ·  Project name: {{project_name}}
+Minimum default confidence threshold: {{confidence_threshold}}
+
+Output ONLY a JSON array. Do not wrap with backticks.`;
+
+const GENERIC_CAPTION_SYSTEM = `You are a concise single-sentence image annotator writing for an ML image-caption dataset.
+Ground rules:
+- Write a single natural-language sentence describing the whole image (do not list items bullet-style).
+- Do NOT write: "This is a picture of…" / "In this image…" / any meta-comment about the captioning task.
+- Describe physical content you can visually confirm (do not invent subjective feelings).
+- Keep length: 15~80 Chinese characters, or 15~70 English words, whichever is more natural for the image.
+- Preserve proper nouns as-is (license plates / proper names are anonymized where illegible).`;
+
+const GENERIC_CAPTION_USER = `Describe the following image in one natural-language sentence.
+Image size: {{image_width}} x {{image_height}} px.
+Task: {{task_name}}  ·  Project: {{project_name}}
+
+Return ONLY the sentence (no JSON wrapper, no bullet points).`;
+
+const TRAFFIC_9CLASS_LABELS: LabelSpec[] = [
+    {
+        name: 'pedestrian', type: 'rectangle',
+        description: 'Pedestrian / person on foot: standing, walking, running, crossing. Includes people pushing bicycles by hand (riderless), people holding umbrellas, queuing crowds (each person a separate box).',
+    },
+    {
+        name: 'cyclist', type: 'rectangle',
+        description: 'Cyclist = any 2-wheeled non-motorized road user that still carries a rider: bicycles, shared bikes, electric-bicycles (e-bikes ridden as bikes), tricycles pedaled by rider, with visible rider on saddle.',
+    },
+    {
+        name: 'motor_vehicle', type: 'rectangle',
+        description: 'Motorized 4+ wheel vehicle traveling on the road lane: cars, SUVs, MPVs, taxis, police cars, buses, coaches, trucks, vans, ambulances on duty, sanitation trucks, fire engines, engineering vehicles on paved lanes.',
+    },
+    {
+        name: 'non_motor_vehicle', type: 'rectangle',
+        description: 'Non-motorized 2-3 wheeled large non-rider categories: hand-pushed carts, unicycles in construction areas, heavy delivery tricycles standing/riderless, animal-drawn vehicles on urban roads.',
+    },
+    {
+        name: 'traffic_cone', type: 'rectangle',
+        description: 'Traffic cone / 雪糕筒: conical shape, rubber/PVC material, orange+white, typically placed on road surface to redirect traffic. Each standalone cone = its own box; conjoined groups (welded together) as one box.',
+    },
+    {
+        name: 'traffic_bucket', type: 'rectangle',
+        description: 'Traffic bucket / 防撞桶: cylindrical drum-shaped, large round plastic or FRP bucket usually with yellow+black or red+white reflective strips, filled with sand/water for crash cushioning at median openings/toll booth exits.',
+    },
+    {
+        name: 'traffic_column', type: 'rectangle',
+        description: 'Traffic column / 交通柱 (警示柱): short, rigid vertical plastic/metal bollard post fixed on road surface (white+black/yellow+black stripes, sometimes with reflective bands, no conical tip), used to block vehicular entry to pedestrian zones.',
+    },
+    {
+        name: 'plastic_barrier', type: 'rectangle',
+        description: 'Plastic barrier / 水马 / 塑料围挡: large, hollow blow-molded PE barrier panels (often red/white or yellow/black, sometimes with water/sand fill nozzles on top, can be linked in a chain), used for work-zone separation.',
+    },
+    {
+        name: 'traffic_light', type: 'rectangle',
+        description: 'Traffic light / 信号灯 pole unit: one full traffic-light assembly (can include multiple lamp heads, countdown timers, pedestrian/man signals mounted on the same vertical supporting pole/arm). Each assembly = 1 box. Do NOT split individual lamp heads.',
+    },
+];
+
+export const PRESET_BUNDLES: PresetBundle[] = [
+    {
+        id: 'traffic_9class_v9',
+        name: 'Traffic 9-Class Detector (V9, Bailian qwen3-vl-plus)',
+        description: '9 Chinese traffic classes (pedestrian/cyclist/motor_vehicle/non_motor_vehicle/traffic_cone/traffic_bucket/traffic_column/plastic_barrier/traffic_light) with the full V9 recall-prompt and output_parser_config.',
+        appliesTo: ['object_detector'],
+        defaultFor: ['object_detector'],
+        defaults: {
+            execution_mode: 'vlm_prompt',
+            output_format: 'rectangles',
+            system_prompt_template: TRAFFIC_SYSTEM,
+            user_prompt_template: TRAFFIC_USER,
+            output_parser_config: {
+                canonical_box_min_span: 6,
+                confidence_threshold_default: 0.5,
+                coordinate_system: 'canonical_1000',
+                iou_threshold_nms: 0.5,
+                iou_threshold_recall_merge: 0.6,
+                global_area_min_px: 100,
+                global_ratio_min: 0.05,
+                global_ratio_max: 18.0,
+                global_area_ratio_max_per_image: 0.9,
+                recall_second_call_min_total_pixels: 500000,
+                vlm_call_timeout_seconds: 300,
+            },
+            labels: TRAFFIC_9CLASS_LABELS,
+        },
+    },
+    {
+        id: 'generic_detector',
+        name: 'Generic Object Detector',
+        description: 'Minimal detection preset that works with any vision-LLM supporting compatible chat completions. Fill in your custom labels on the Labels tab after loading.',
+        appliesTo: ['object_detector'],
+        defaultFor: [],
+        defaults: {
+            execution_mode: 'vlm_prompt',
+            output_format: 'rectangles',
+            system_prompt_template: GENERIC_DET_SYSTEM,
+            user_prompt_template: GENERIC_DET_USER,
+            output_parser_config: {
+                canonical_box_min_span: 4,
+                confidence_threshold_default: 0.5,
+                coordinate_system: 'canonical_1000',
+                iou_threshold_nms: 0.5,
+            },
+            labels: [
+                { name: 'object', type: 'rectangle', description: 'Replace with your custom labels in the Labels tab.' },
+            ],
+        },
+    },
+    {
+        id: 'generic_caption',
+        name: 'Generic Image Caption',
+        description: 'Single-sentence image caption preset (15~80 chars, no meta-phrases) with the caption_attribute_name configurable below.',
+        appliesTo: ['image_caption'],
+        defaultFor: ['image_caption'],
+        defaults: {
+            execution_mode: 'vlm_prompt',
+            output_format: 'captions',
+            system_prompt_template: GENERIC_CAPTION_SYSTEM,
+            user_prompt_template: GENERIC_CAPTION_USER,
+            output_parser_config: {
+                caption_attribute_name: 'caption',
+                vlm_call_timeout_seconds: 300,
+            },
+            labels: [],
+        },
+    },
+    {
+        id: 'clrernet_lane_dla34',
+        name: 'CLRerNet Lane Detector (local ONNX)',
+        description: 'Local CLRerNet+DLA34 ONNX lane detector. Outputs CVAT polylines (label lane) with position / Occlusion attributes. Does not call Bailian. Requires clrernet_dla34_320x800_20260813-sim.onnx mounted at /opt/cvat/models/.',
+        appliesTo: ['object_detector'],
+        defaultFor: [],
+        defaults: {
+            provider: 'local',
+            model: 'clrernet_dla34',
+            execution_mode: 'vision_pipeline',
+            output_format: 'polylines',
+            system_prompt_template: '',
+            user_prompt_template: '',
+            output_parser_config: {
+                confidence_threshold_default: 0.41,
+            },
+            labels: [
+                {
+                    name: 'lane',
+                    type: 'polyline',
+                    description: 'Lane line or road boundary as a polyline. Points run from near the ego vehicle (image bottom) toward the vanishing point.',
+                    attributes: [
+                        {
+                            name: 'position',
+                            input_type: 'select',
+                            values: ['left-lane', 'left-left-lane', 'right-lane', 'right-right-lane'],
+                            default_value: 'left-lane',
+                            mutable: true,
+                        },
+                        {
+                            name: 'Occlusion',
+                            input_type: 'select',
+                            values: ['0', '1', '2'],
+                            default_value: '0',
+                            mutable: true,
+                        },
+                    ],
+                },
+            ],
+        },
+    },
+    {
+        id: 'http_microservice_detector',
+        name: 'HTTP Microservice Detector (multipart POST)',
+        description: 'Official contract: POST {api_url}/predict as multipart (file field default "image"). Response {code:0, shapes:[{label, type:rectangle|polygon|polyline, points, confidence?}]}. Video tracks (later): same object keeps track_id/object_id across frames. Optional GET /health {status:"ok"} and GET /labels [{name, type}] so Test connection can fill the Labels tab. Extra knobs: query string on the predict URL (?conf_thres=0.43) or Extra form fields. No Bailian / no ONNX / no OpenAPI.',
+        appliesTo: ['object_detector'],
+        defaultFor: [],
+        defaults: {
+            provider: 'local',
+            model: 'http_detector',
+            api_url: 'http://192.168.50.42:8080/predict',
+            local_backend: 'http_microservice',
+            http_file_field: 'image',
+            http_form_fields: { layout_on_box: '1' },
+            http_timeout_seconds: 120,
+            execution_mode: 'vision_pipeline',
+            output_format: 'mixed',
+            system_prompt_template: '',
+            user_prompt_template: '',
+            output_parser_config: {
+                coordinate_system: 'real_pixel',
+                bbox_format: 'auto',
+                confidence_threshold_default: 0.0,
+            },
+            labels: [
+                { name: 'object', type: 'any', description: 'Generic fallback when the service does not name the class. Click Test connection to replace this list from GET /labels.' },
+                { name: 'box', type: 'polygon', description: 'Document / layout outer box (8080 example; often a rotated polygon).' },
+                { name: 'image', type: 'rectangle', description: 'Embedded image / figure region (8080 example).' },
+            ],
+        },
+    },
+    {
+        id: 'semi3d_vehicle_detector',
+        name: 'Semi3D Vehicle Detector (8082 /predict)',
+        description: 'Colleague video detector: POST http://192.168.50.42:8082/predict?conf_thres=0.3 multipart field "image". Each vehicle is VanCar rectangle + VanCar_kpts points + Rear rectangle (parent_index). Same object keeps track_id/object_id across frames so Automatic annotation assembles CVAT Tracks and groups the three shapes. No layout_on_box. Optional GET /health and GET /labels. Optical Flow is not used.',
+        appliesTo: ['object_detector'],
+        defaultFor: [],
+        defaults: {
+            provider: 'local',
+            model: 'http_detector',
+            api_url: 'http://192.168.50.42:8082/predict?conf_thres=0.3',
+            local_backend: 'http_microservice',
+            http_file_field: 'image',
+            http_timeout_seconds: 120,
+            execution_mode: 'vision_pipeline',
+            output_format: 'mixed',
+            system_prompt_template: '',
+            user_prompt_template: '',
+            output_parser_config: {
+                coordinate_system: 'real_pixel',
+                bbox_format: 'xyxy',
+                confidence_threshold_default: 0.0,
+            },
+            labels: [
+                { name: 'VanCar', type: 'rectangle', description: 'Vehicle outer box (parent). Needs track_id on video frames.' },
+                { name: 'VanCar_kpts', type: 'points', description: 'Five keypoints; parent_index points at VanCar. track_id is inherited.' },
+                { name: 'Rear', type: 'rectangle', description: 'Rear box; parent_index points at VanCar. track_id is inherited.' },
+            ],
+        },
+    },
+    {
+        id: 'http_microservice_tracker',
+        name: 'HTTP Microservice Tracker (POST /track)',
+        description: 'Colleague POST {api_url}/track multipart (image + shape JSON + optional state). api_url is required. Optical Flow (DIS) is disabled. For video MOT prefer an Object Detector that returns stable id/track_id, then run Automatic annotation.',
+        appliesTo: ['object_tracker'],
+        defaultFor: ['object_tracker'],
+        defaults: {
+            provider: 'local',
+            model: 'http_tracker',
+            api_url: '',
+            local_backend: 'http_tracker',
+            http_file_field: 'image',
+            http_timeout_seconds: 60,
+            execution_mode: 'vision_pipeline',
+            output_format: 'rectangles',
+            system_prompt_template: '',
+            user_prompt_template: '',
+            output_parser_config: {
+                coordinate_system: 'real_pixel',
+                bbox_format: 'xyxy',
+            },
+            labels: [
+                { name: 'object', type: 'rectangle', description: 'Tracked object. The job label (e.g. car) is chosen in Magic Wand, not here.' },
+            ],
+        },
+    },
+];
+
+export function findPreset(id: string | null | undefined): PresetBundle | undefined {
+    if (!id || typeof id !== 'string') return undefined;
+    const exact = PRESET_BUNDLES.find((p) => p.id === id);
+    if (exact) return exact;
+    const aliasKey = PRESET_ID_ALIASES[id];
+    if (aliasKey) return PRESET_BUNDLES.find((p) => p.id === aliasKey) || undefined;
+    const normalized = id.trim().toLowerCase();
+    for (const p of PRESET_BUNDLES) {
+        if (p.id.toLowerCase() === normalized) return p;
+        if (p.name.trim().toLowerCase() === normalized) return p;
+    }
+    for (const [fromAlias, toId] of Object.entries(PRESET_ID_ALIASES)) {
+        if (fromAlias.toLowerCase() === normalized) {
+            return PRESET_BUNDLES.find((p) => p.id === toId) || undefined;
+        }
+    }
+    return undefined;
+}
+export function resolvePresetIdCanonical(id: string | null | undefined): string | undefined {
+    const p = findPreset(id);
+    return p ? p.id : (typeof id === 'string' && id.trim() ? id.trim() : undefined);
+}

@@ -1,0 +1,363 @@
+"""Assemble per-frame detector boxes into CVAT tracks.
+
+Cross-frame identity prefers detector ``track_id`` / ``object_id`` /
+``instance_id`` (HTTP /predict). Generic per-frame ``id`` is ignored.
+Same-frame children (``parent_index`` → shared ``group``) inherit that
+key so VanCar / point1..point5 / Rear (or Side) become grouped tracks.
+
+If the detector does not send a stable id, ``assign_iou_track_keys``
+stitches adjacent-frame boxes. In-process BoT-SORT is retired.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from collections import defaultdict
+from copy import deepcopy
+from typing import Any
+
+TRACK_KEY_FIELD = "_track_key"
+TRACK_ID_ATTR = "track_id"
+_INTERNAL_SHAPE_KEYS = ("_part", TRACK_KEY_FIELD)
+_AUTO_SOURCE = "auto"
+DEFAULT_ASSOC_IOU = 0.45
+DEFAULT_MAX_FRAME_GAP = 5
+# Detector/track_id tracks: interpolate short misses instead of outside.
+DEFAULT_MAX_INTERP_GAP = 30
+_IOU_KEY_PREFIX = "iou:"
+# LabeledShape has `score`; TrackedShape does not (no ScoredAnnotationMixin).
+_TRACKED_SHAPE_KEYS = frozenset({
+    "frame", "type", "occluded", "outside", "z_order", "points", "rotation", "attributes",
+})
+
+
+def strip_internal_track_fields(items: list | None) -> None:
+    """Remove video-only keys so layout/lane/VLM shapes can be saved as SHAPES."""
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        for key in _INTERNAL_SHAPE_KEYS:
+            item.pop(key, None)
+
+
+def upsert_track_id_attr(
+    shape: dict[str, Any],
+    key: str,
+    spec_id: int | None = None,
+) -> None:
+    """Write detector/IoU identity onto a CVAT shape so the UI can show it."""
+    value = str(key or "").strip()
+    if not value:
+        return
+    attrs = shape.setdefault("attributes", [])
+    if not isinstance(attrs, list):
+        attrs = []
+        shape["attributes"] = attrs
+    if spec_id is not None:
+        for item in attrs:
+            if isinstance(item, dict) and item.get("spec_id") == spec_id:
+                item["value"] = value
+                return
+        attrs.append({"spec_id": spec_id, "value": value})
+        return
+    for item in attrs:
+        if isinstance(item, dict) and str(item.get("name") or "") == TRACK_ID_ATTR:
+            item["value"] = value
+            return
+    attrs.append({"name": TRACK_ID_ATTR, "value": value})
+
+
+def _track_id_spec_id(label_id: Any, cache: dict[Any, int | None]) -> int | None:
+    if label_id in cache:
+        return cache[label_id]
+    spec_id: int | None = None
+    try:
+        from cvat.apps.engine.models import AttributeSpec, AttributeType
+
+        spec, _created = AttributeSpec.objects.get_or_create(
+            label_id=int(label_id),
+            name=TRACK_ID_ATTR,
+            defaults={
+                "mutable": True,
+                "input_type": AttributeType.TEXT.value,
+                "default_value": "",
+                "values": "",
+            },
+        )
+        if not spec.mutable:
+            spec.mutable = True
+            spec.save(update_fields=["mutable"])
+        spec_id = int(spec.id)
+    except Exception:
+        spec_id = None
+    cache[label_id] = spec_id
+    return spec_id
+
+
+def _stable_group_id(seed: str) -> int:
+    digest = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    n = int(digest[:8], 16) & 0x7FFFFFFF
+    return n if n else 1
+
+
+def _box_xyxy(shape: dict[str, Any]) -> list[float] | None:
+    pts = shape.get("points")
+    if not isinstance(pts, (list, tuple)) or len(pts) < 2:
+        return None
+    try:
+        nums = [float(x) for x in pts]
+    except (TypeError, ValueError):
+        return None
+    if len(nums) < 4:
+        return None
+    typ = str(shape.get("type") or "").lower()
+    if typ == "rectangle":
+        x1, y1, x2, y2 = nums[0], nums[1], nums[2], nums[3]
+        return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+    xs, ys = nums[0::2], nums[1::2]
+    if not xs or not ys:
+        return None
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
+def _box_area(box: list[float]) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _iou(a: list[float], b: list[float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    union = _box_area(a) + _box_area(b) - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def _family_groups(frame_shapes: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Cluster one frame by CVAT group. Ungrouped shapes are each their own family."""
+    by_group: dict[Any, list[dict[str, Any]]] = defaultdict(list)
+    singles: list[list[dict[str, Any]]] = []
+    for shape in frame_shapes:
+        if not isinstance(shape, dict):
+            continue
+        group = shape.get("group")
+        if group in (None, 0, "0"):
+            singles.append([shape])
+        else:
+            by_group[group].append(shape)
+    return list(by_group.values()) + singles
+
+
+def _anchor_box(members: list[dict[str, Any]]) -> list[float] | None:
+    """Largest rectangle in the family; otherwise bbox of any geometry."""
+    best: list[float] | None = None
+    best_area = -1.0
+    fallback: list[float] | None = None
+    fallback_area = -1.0
+    for shape in members:
+        box = _box_xyxy(shape)
+        if box is None:
+            continue
+        area = _box_area(box)
+        typ = str(shape.get("type") or "").lower()
+        if typ == "rectangle" and area > best_area:
+            best = box
+            best_area = area
+        if area > fallback_area:
+            fallback = box
+            fallback_area = area
+    return best if best is not None else fallback
+
+
+def assign_iou_track_keys(
+    shapes: list[dict[str, Any]],
+    *,
+    iou_threshold: float = DEFAULT_ASSOC_IOU,
+    max_frame_gap: int = DEFAULT_MAX_FRAME_GAP,
+) -> int:
+    """Set ``_track_key`` on shapes that have no detector id, via IoU association.
+
+    Returns how many shapes received a new ``iou:`` key. Existing ``_track_key``
+    values are left unchanged (and those families are not re-matched).
+    """
+    try:
+        thr = float(iou_threshold)
+    except (TypeError, ValueError):
+        thr = DEFAULT_ASSOC_IOU
+    thr = max(0.05, min(0.95, thr))
+    try:
+        gap_lim = max(1, int(max_frame_gap))
+    except (TypeError, ValueError):
+        gap_lim = DEFAULT_MAX_FRAME_GAP
+
+    by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for shape in shapes:
+        if not isinstance(shape, dict):
+            continue
+        try:
+            frame = int(shape.get("frame") or 0)
+        except (TypeError, ValueError):
+            continue
+        by_frame[frame].append(shape)
+
+    assigned = 0
+    next_id = 1
+    active: list[dict[str, Any]] = []
+
+    def _stamp(members: list[dict[str, Any]], tid: str) -> None:
+        nonlocal assigned
+        gid = _stable_group_id(tid)
+        for shape in members:
+            if shape.get(TRACK_KEY_FIELD):
+                continue
+            shape[TRACK_KEY_FIELD] = tid
+            shape["group"] = gid
+            assigned += 1
+
+    for frame in sorted(by_frame):
+        families = _family_groups(by_frame[frame])
+        pending: list[dict[str, Any]] = []
+        for members in families:
+            if any(m.get(TRACK_KEY_FIELD) for m in members):
+                continue
+            box = _anchor_box(members)
+            if box is None:
+                continue
+            pending.append({"box": box, "members": members})
+
+        pairs: list[tuple[float, int, int]] = []
+        for i, fam in enumerate(pending):
+            for j, act in enumerate(active):
+                if frame - int(act["last_frame"]) > gap_lim:
+                    continue
+                score = _iou(fam["box"], act["box"])
+                if score >= thr:
+                    pairs.append((score, i, j))
+        pairs.sort(key=lambda item: item[0], reverse=True)
+
+        used_fam: set[int] = set()
+        used_act: set[int] = set()
+        for _score, i, j in pairs:
+            if i in used_fam or j in used_act:
+                continue
+            used_fam.add(i)
+            used_act.add(j)
+            tid = str(active[j]["tid"])
+            _stamp(pending[i]["members"], tid)
+            active[j] = {
+                "tid": tid,
+                "box": pending[i]["box"],
+                "last_frame": frame,
+            }
+
+        for i, fam in enumerate(pending):
+            if i in used_fam:
+                continue
+            tid = f"{_IOU_KEY_PREFIX}{next_id}"
+            next_id += 1
+            _stamp(fam["members"], tid)
+            active.append({"tid": tid, "box": fam["box"], "last_frame": frame})
+
+        active = [a for a in active if frame - int(a["last_frame"]) <= gap_lim]
+
+    return assigned
+
+
+def stitch_shapes_into_tracks(
+    shapes: list[dict[str, Any]],
+    *,
+    last_frame: int | None,
+    max_interp_gap: int = DEFAULT_MAX_INTERP_GAP,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    grouped: dict[tuple[Any, Any, str], list[dict[str, Any]]] = defaultdict(list)
+    leftovers: list[dict[str, Any]] = []
+    for raw in shapes:
+        if not isinstance(raw, dict):
+            continue
+        shape = dict(raw)
+        key = shape.pop(TRACK_KEY_FIELD, None)
+        if key is None or str(key).strip() == "":
+            leftovers.append(shape)
+            continue
+        grouped[(shape.get("label_id"), shape.get("type"), str(key).strip())].append(shape)
+
+    tracks: list[dict[str, Any]] = []
+    spec_cache: dict[Any, int | None] = {}
+    for gkey, path in grouped.items():
+        interpolate = str(gkey[2]).startswith(_IOU_KEY_PREFIX)
+        try:
+            interp_lim = max(0, int(max_interp_gap))
+        except (TypeError, ValueError):
+            interp_lim = DEFAULT_MAX_INTERP_GAP
+        path.sort(key=lambda item: int(item.get("frame") or 0))
+        by_frame: dict[int, dict[str, Any]] = {}
+        for box in path:
+            by_frame[int(box.get("frame") or 0)] = box
+        path = [by_frame[frame] for frame in sorted(by_frame)]
+        if not path:
+            continue
+
+        box0 = path[0]
+        is_part = any(bool(b.get("_part")) for b in path) or str(gkey[1] or "").lower() == "points"
+        track_group = box0.get("group")
+        track_key = str(gkey[2]).strip()
+        spec_id = _track_id_spec_id(box0.get("label_id"), spec_cache)
+        keyframes: list[dict[str, Any]] = []
+        for box in path:
+            raw = deepcopy(box)
+            item = {k: raw[k] for k in _TRACKED_SHAPE_KEYS if k in raw}
+            item["outside"] = False
+            item.setdefault("occluded", False)
+            item.setdefault("z_order", 0)
+            item.setdefault("attributes", [])
+            upsert_track_id_attr(item, track_key, spec_id)
+            item.setdefault("frame", raw.get("frame", 0))
+            item.setdefault("type", raw.get("type") or "rectangle")
+            if "points" not in item:
+                item["points"] = list(raw.get("points") or [])
+            keyframes.append(item)
+
+        filled: list[dict[str, Any]] = []
+        for shp in keyframes:
+            if filled:
+                prev = filled[-1]
+                prev_f = int(prev["frame"])
+                cur_f = int(shp["frame"])
+                gap_len = cur_f - prev_f - 1
+                # Root boxes: allow a 1-frame miss only. Longer gaps (exit /
+                # occlusion) get an outside keyframe so CVAT does not lerp a
+                # ghost across empty frames. Parts never stay when parent is gone.
+                # IoU-stitched tracks may still bridge up to max_interp_gap.
+                if gap_len > 0 and (
+                    is_part
+                    or (interpolate and gap_len > interp_lim)
+                    or (not interpolate and gap_len > 1)
+                ):
+                    gap = deepcopy(prev)
+                    gap["outside"] = True
+                    gap["frame"] = prev_f + 1
+                    gap.pop("id", None)
+                    filled.append(gap)
+            filled.append(shp)
+
+        if last_frame is not None and filled and int(filled[-1]["frame"]) < int(last_frame):
+            end = deepcopy(filled[-1])
+            end["outside"] = True
+            end["frame"] = int(filled[-1]["frame"]) + 1
+            end.pop("id", None)
+            filled.append(end)
+
+        tracks.append(
+            {
+                "label_id": box0["label_id"],
+                "group": track_group,
+                "attributes": [],
+                "frame": box0["frame"],
+                "shapes": filled,
+                "source": _AUTO_SOURCE,
+            }
+        )
+    return tracks, leftovers
